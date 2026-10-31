@@ -1,0 +1,33 @@
+services:
+  ubuntu-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ubuntu24-dev-box
+    hostname: dev-box
+    restart: unless-stopped
+    # NET_ADMIN and /dev/net/tun are required if your sing-box scripts use TUN mode
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # Required for Chromium to run smoothly inside a container
+    shm_size: '2gb'
+    ports:
+      - "8080:8080" # VS Code (code-server) Web UI
+      - "6901:6080" # noVNC Web Desktop (to view and use Chromium)
+      - "1080:1080" # Optional: Expose sing-box SOCKS/HTTP port to host
+    volumes:
+      - ./workspace:/home/coder/workspace
+      - ./sing-box:/etc/sing-box
+      - vscode-data:/home/coder/.local/share/code-server
+    environment:
+      - PASSWORD=devpassword123
+      - HTTP_PROXY=http://127.0.0.1:2080
+      - HTTPS_PROXY=http://127.0.0.1:2080
+      - ALL_PROXY=socks5://127.0.0.1:2080
+      - NO_PROXY=localhost,127.0.0.1
+
+volumes:
+  vscode-data:

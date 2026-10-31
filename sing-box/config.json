@@ -1,0 +1,124 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "type": "tls",
+        "tag": "dns-remote",
+        "server": "8.8.8.8",
+        "detour": "auto-proxy"
+      },
+      {
+        "type": "https",
+        "tag": "dns-local",
+        "server": "223.5.5.5"
+      }
+    ],
+    "rules": [],
+    "final": "dns-remote"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "sing-tun",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "auto_route": true,
+      "strict_route": true,
+      "sniff": true,
+      "stack": "gvisor",
+      "mtu": 1400,
+      "endpoint_independent_nat": true,
+      "sniff": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "auto-proxy",
+      "outbounds": [
+        "proxy",
+        "vless-germany-2"
+      ],
+      "url": "https://gstatic.com",
+      "interval": "3m",
+      "tolerance": 50
+    },
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "66.90.92.53",
+      "server_port": 443,
+      "uuid": "d415c24a-5fc3-00bd-9d42-4fbc60d18cb4",
+      "flow": "xtls-rprx-vision",
+      "network": "tcp",
+      "domain_resolver": "dns-remote",
+      "tls": {
+        "enabled": true,
+        "server_name": "919c2e654b58.j.cloudfront.hls.ttvnw.net",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "edge"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "10rVZPoOUP1TlQviIAsQ_jAROX0fRQxH0C92nq_zGQc",
+          "short_id": "43dcff53849b81e6"
+        }
+      }
+    },
+    {
+      "type": "vless",
+      "tag": "vless-germany-2",
+      "server": "2.27.143.10",
+      "server_port": 443,
+      "uuid": "d415c24a-5fc3-0005-9d42-4fbc60d18cb4",
+      "flow": "xtls-rprx-vision",
+      "network": "tcp",
+      "domain_resolver": "dns-remote",
+      "tls": {
+        "enabled": true,
+        "server_name": "7dfcb88758ec.j.cloudfront.hls.ttvnw.net",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "edge"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "10rVZPoOUP1TlQviIAsQ_jAROX0fRQxH0C92nq_zGQc",
+          "short_id": "43dcff53849b81e6"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct",
+      "domain_resolver": "dns-local"
+    }
+  ],
+    "route": {
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "port": [53, 123],
+        "outbound": "direct"
+      }
+    ],
+    "final": "auto-proxy",
+    "auto_detect_interface": true
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true
+    }
+  }
+}
+
