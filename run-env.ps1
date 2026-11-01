@@ -1,1 +1,1 @@
-﻿ docker compose down; docker compose up -d --build; docker compose exec ubuntu-dev bash
+﻿ docker compose down; docker compose up -d --build; docker compose exec ubuntu24-dev-box bash
