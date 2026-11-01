@@ -74,18 +74,15 @@ If `curl` shows your real IP, sing-box is down — see Troubleshooting.
 
 - **`chromium: no internet` in noVNC** → `docker exec -it ubuntu24-dev-box bash`, then `curl -s https://ipinfo.io`. If that fails, sing-box is down:
 
-&#x20; ```bash
+```bash
 
-&#x20; supervisorctl status
+supervisorctl status
+tail -n 50 /var/log/supervisor/sing-box.err.log
 
-&#x20; tail -n 50 /var/log/supervisor/sing-box.err.log
-
-&#x20; ```
+```
 
 - **noVNC shows black screen** → `supervisorctl status xvfb fluxbox x11vnc`. Restart with `supervisorctl restart xvfb`.
 
 - **`setup-vpn.sh` failed at first start** (404, network) → exec into the container, fix `VERSION=` in `/etc/sing-box/setup-vpn.sh`, then `supervisorctl restart sing-box`.
 
 - **Container recreates and loses everything** → expected; mount `./workspace` for persistent data.
-
-```
