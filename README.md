@@ -1,10 +1,4 @@
-\## Rewrite you can push
-
-
-
-```markdown
-
-\# developer-infra
+# Instructions to start development
 
 
 
