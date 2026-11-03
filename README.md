@@ -28,7 +28,7 @@ cd developer-infra
 ```bash
 chmod +x run-env.sh
 
-./run-env
+./run-env.sh
 
 ```
 
