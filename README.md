@@ -8,7 +8,7 @@ Dockerized Ubuntu 24.04 dev box: Chromium (proxied via sing-box TUN), code-serve
 - **Windows**: Docker Desktop with WSL2 backend
 - **Linux**: `xhost` (for `x11-xserver-utils`) — not needed for noVNC access, only if you switch to native window later
 
-Install Docker if missing: https://docs.docker.com/engine/install/
+Install Docker if missing: https://github.com/Macsik121/setup-vpn
 
 ## Start
 
