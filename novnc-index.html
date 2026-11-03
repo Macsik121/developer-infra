@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Chromium (noVNC)</title>
+  <!--
+    The Debian novnc package ships no index.html, so without this file
+    websockify serves a bare directory listing at http://localhost:6901/.
+    Redirect to the noVNC client so both URLs work.
+  -->
+  <meta http-equiv="refresh" content="0; url=vnc.html">
+  <script>window.location.replace('vnc.html');</script>
+</head>
+<body>
+  <p>Redirecting to <a href="vnc.html">the noVNC client</a>…</p>
+</body>
+</html>

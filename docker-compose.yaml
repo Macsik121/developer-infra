@@ -6,6 +6,12 @@ services:
     container_name: ubuntu24-dev-box
     hostname: dev-box
 
+    # WSLg's X server is software-composited, so Chromium is CPU-bound.
+    # Give it headroom: no tight CPU cap, and enough RAM that the
+    # renderer/GPU-process aren't fighting over 8 GB.
+    cpus: 6
+    mem_limit: 10g
+
     stdin_open: true
     tty: true
 
@@ -25,9 +31,17 @@ services:
       - ./workspace:/home/coder/workspace
       - ./sing-box:/etc/sing-box
       - vscode-data:/home/coder/.local/share/code-server
+      - chromium-profile:/home/coder/.chromium-profile
+      # WSLg X server socket. This is what makes Chromium open as a separate
+      # window on the Windows desktop instead of only inside noVNC.
+      # The source path exists inside the docker-desktop WSL VM.
+      - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix
 
     environment:
       - PASSWORD=devpassword123
+      # WSLg display. No X socket (Linux host) falls back to Xvfb :99 in
+      # supervisord.conf; on Linux mount /tmp/.X11-unix yourself.
+      - DISPLAY=:0
       # sing-box runs in TUN mode (config.json has only a TUN inbound).
       # Do NOT set HTTP_PROXY/HTTPS_PROXY/ALL_PROXY here: those break
       # apt/curl until TUN is fully up, and Chromium does not need them
@@ -35,3 +49,7 @@ services:
 
 volumes:
   vscode-data:
+  # Named so the profile survives `docker compose up --build`. A bind-mount
+  # from Windows would put Chrome's SQLite files on the 9p/drvfs path, which
+  # is a known source of browser stalls; the named volume stays inside the VM.
+  chromium-profile:

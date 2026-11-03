@@ -40,10 +40,32 @@ On first run, `sing-box` is installed automatically by `setup-vpn.sh` inside the
 
 | Service | URL |
 |---|---|
-| Chromium (via noVNC) | <http://localhost:6901> |
+| Chromium (via noVNC) | <http://localhost:6901/vnc.html> |
 | code-server | <http://localhost:8080> (password: `devpassword123` — change before exposing externally) |
 
 Chromium is already running inside noVNC when the page loads. Traffic goes through sing-box transparently; do **not** add `--proxy-server`.
+
+### Host window (WSLg)
+
+On Windows, Chromium opens as a **separate window on the desktop** — it draws straight onto WSLg's X server `:0`, which `docker compose` reaches through the `/run/desktop/mnt/host/wslg/.X11-unix` bind. noVNC shows that same desktop, so resizing the host window changes the browser view too.
+
+Requires Docker Desktop with the WSL2 backend and GUI apps (the default). Smoke test — the `TMPDIR` part is required, otherwise `docker exec` mounts a temp dir over `/tmp` and hides the X socket:
+
+```powershell
+MSYS_NO_PATHCONV=1 TMPDIR=$env:TEMP docker exec -e DISPLAY=:0 ubuntu24-dev-box xeyes
+```
+
+If no `X0` socket is mounted, Xvfb on `:99` starts automatically and noVNC still works.
+
+Chromium opens **once**, when the container starts. Closing the window closes it — it does not pop back. To open it again:
+
+```powershell
+docker exec ubuntu24-dev-box open-chromium
+```
+
+or `docker exec ubuntu24-dev-box supervisorctl start chromium`.
+
+**Linux hosts:** use `xhost +local:docker` and bind-mount `/tmp/.X11-unix:/tmp/.X11-unix` instead of the WSLg path.
 
 ## Verify
 
@@ -81,6 +103,8 @@ supervisorctl status
 tail -n 50 /var/log/supervisor/sing-box.err.log
 
 ```
+
+- **`http://localhost:6901` shows a directory listing instead of the browser** → the URL is missing the client page. Open <http://localhost:6901/vnc.html>. The image ships an `index.html` that redirects there, so a bare `/` works too after a rebuild.
 
 - **noVNC shows black screen** → `supervisorctl status xvfb fluxbox x11vnc`. Restart with `supervisorctl restart xvfb`.
 
