@@ -41,6 +41,7 @@ RUN mkdir -p /home/coder/workspace /etc/sing-box /var/log/supervisor && \
 #    start (see CMD below), not at build time, because the bind-mount
 #    overwrites what we sanitize here.
 COPY ./sing-box /etc/sing-box
+COPY ./start-claude.sh /usr/local/bin/
 
 # 9. Supervisor config
 COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # ==============================================================================
 # Synopsis: Launches Claude Code with model selection via OmniRoute proxy.
 # Usage:

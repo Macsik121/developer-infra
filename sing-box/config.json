@@ -42,43 +42,38 @@
       "type": "urltest",
       "tag": "auto-proxy",
       "outbounds": [
-        "proxy",
-        "vless-germany-2"
+        "🇨🇦 ⚡️ ⭐️ Канада"
       ],
       "url": "https://gstatic.com",
       "interval": "3m",
       "tolerance": 50
     },
-    {
-      "type": "vless",
-      "tag": "proxy",
-      "server": "66.90.92.53",
-      "server_port": 443,
-      "uuid": "d415c24a-5fc3-00bd-9d42-4fbc60d18cb4",
-      "flow": "xtls-rprx-vision",
-      "network": "tcp",
-      "domain_resolver": "dns-remote",
-      "tls": {
-        "enabled": true,
-        "server_name": "919c2e654b58.j.cloudfront.hls.ttvnw.net",
-        "utls": {
-          "enabled": true,
-          "fingerprint": "edge"
-        },
-        "reality": {
-          "enabled": true,
-          "public_key": "10rVZPoOUP1TlQviIAsQ_jAROX0fRQxH0C92nq_zGQc",
-          "short_id": "43dcff53849b81e6"
-        }
-      }
+{
+  "type": "vless",
+  "tag": "🇨🇦 ⚡️ ⭐️ Канада",
+  "server": "132.243.205.5",
+  "server_port": 443,
+  "uuid": "d415c24a-5fc3-48eb-9d42-4fbc60d18cb4",
+  "flow": "xtls-rprx-vision",
+  "network": "tcp",
+  "domain_resolver": "dns-remote",
+  "tls": {
+    "enabled": true,
+    "server_name": "7dba300ff494.j.cloudfront.hls.ttvnw.net",
+    "utls": {
+      "enabled": true,
+      "fingerprint": "edge"
     },
+    "reality": {
+      "enabled": true,
+      "public_key": "10rVZPoOUP1TlQviIAsQ_jAROX0fRQxH0C92nq_zGQc",
+      "short_id": "43dcff53849b81e6"
+    }
+  }
+},
     {
       "type": "vless",
-      "tag": "vless-germany-2",
-      "server": "2.27.143.10",
-      "server_port": 443,
-      "uuid": "d415c24a-5fc3-0005-9d42-4fbc60d18cb4",
-      "flow": "xtls-rprx-vision",
+      "tag": "",
       "network": "tcp",
       "domain_resolver": "dns-remote",
       "tls": {
@@ -110,6 +105,10 @@
       {
         "port": [53, 123],
         "outbound": "direct"
+      },
+      {
+         "ip_cidr": ["172.16.0.0/12", "192.168.0.0/16", "10.0.0.0/8"],
+        "outbound": "direct"
       }
     ],
     "final": "auto-proxy",
@@ -121,4 +120,3 @@
     }
   }
 }
-
