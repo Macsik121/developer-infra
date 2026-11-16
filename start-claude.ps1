@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Launches Claude Code with model selection via OmniRoute proxy.
 
@@ -353,24 +353,42 @@ else {
     }
 }
 
-# ============================================
+# ==========================================
 # Phase 5: Set Environment Variables
-# ============================================
+# ==========================================
 Write-ColorOutput "`nSetting up environment..." "Cyan"
 
-$env:ANTHROPIC_AUTH_TOKEN          = $authToken
+# --- 1. Подключение к OmniRoute ---
 $env:ANTHROPIC_BASE_URL            = "$($script:OMNIROUTE_URL)/v1"
-$env:ANTHROPIC_MODEL               = $selectedModel
-$env:ANTHROPIC_deepseek_MODEL      = "deepseek-v4-flash"
+$env:ANTHROPIC_AUTH_TOKEN          = $authToken
 $env:ENABLE_CC_COMPATIBLE_PROVIDER = "true"
-$env:CLAUDE_CODE_SKIP_UPDATE_CHECK = "1"
-$env:CLAUDE_CODE_DISABLE_ARTIFACT  = "1"
+$env:CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1"
 
-$env:ANTHROPIC_DEFAULT_SONNET_MODEL=$selectedModel
-$env:ANTHROPIC_DEFAULT_HAIKU_MODEL=$selectedModel
-$env:ANTHROPIC_DEFAULT_OPUS_MODEL=$selectedModel
-$env:CLAUDE_CODE_SUBAGENT_MODEL=glm-5.2
-$env:CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1
+# --- 2. Основные модели (все тиры -> kr/glm-5) ---
+$env:ANTHROPIC_MODEL               = $selectedModel # или "kr/glm-5"
+$env:ANTHROPIC_DEFAULT_OPUS_MODEL  = "kr/glm-5"
+$env:ANTHROPIC_DEFAULT_SONNET_MODEL= "kr/glm-5"
+$env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "kr/glm-5"
+$env:ANTHROPIC_DEFAULT_FABLE_MODEL = "kr/glm-5"
+
+# --- 3. Модели для субагентов (КРИТИЧЕСКИ ВАЖНО) ---
+$env:CLAUDE_CODE_SUBAGENT_MODEL       = "kr/glm-5"
+$env:CLAUDE_CODE_SUBAGENT_MODEL_FORCE = "1" # Требуется Claude Code v2.1.257+
+$env:CLAUDE_CODE_PERMISSION_MODE = "default"
+$env:CLAUDE_CODE_AUTO_MODE_MODEL = "kr/glm-5"
+
+# --- 4. Классификатор безопасности ---
+$env:CLAUDE_CODE_AUTO_MODE_SERVER = "0"
+
+# --- 5. Прочие оптимизации ---
+$env:CLAUDE_CODE_AUTO_COMPACT_WINDOW = "190000"
+$env:CLAUDE_CODE_SKIP_UPDATE_CHECK   = "1"
+$env:CLAUDE_CODE_DISABLE_ARTIFACT    = "1"
+$env:CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK = "0"
+
+# --- 6. Специфичные для OmniRoute/Devin ---
+$env:DEVIN_BRIDGE_HAIKU_MODEL    = "kr/glm-5"
+$env:DEVIN_BRIDGE_SUBAGENT_MODEL = "kr/glm-5"
 
 Write-ColorOutput "Environment configured:" "Green"
 Write-Host "  ANTHROPIC_MODEL    = $selectedModel"
