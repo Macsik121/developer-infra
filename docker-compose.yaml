@@ -3,17 +3,18 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: ubuntu24-dev-box
-    hostname: dev-box
+    hostname: ${COMPOSE_PROJECT_NAME:-devbox-main}
 
-    # WSLg's X server is software-composited, so Chromium is CPU-bound.
-    # Give it headroom: no tight CPU cap, and enough RAM that the
-    # renderer/GPU-process aren't fighting over 8 GB.
-    cpus: 6
-    mem_limit: 10g
+    # Resource limits parameterized via .env (D2):
+    # Workstation preset: 6 CPU / 10g RAM / 2g shm
+    # Shared Server preset: 2 CPU / 4g RAM / 1g shm
+    cpus: ${CPUS:-6}
+    mem_limit: ${MEM_LIMIT:-10g}
+    shm_size: ${SHM_SIZE:-2g}
 
     stdin_open: true
     tty: true
+    stop_grace_period: 20s
 
     cap_add:
       - NET_ADMIN
@@ -21,35 +22,62 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
 
-    shm_size: '2gb'
+    security_opt:
+      - no-new-privileges:true
+
+    ulimits:
+      nofile:
+        soft: 16384
+        hard: 65536
+
+    labels:
+      - "dev.infra.managed=true"
+      - "dev.infra.project=${COMPOSE_PROJECT_NAME:-devbox-main}"
+      - "dev.infra.ports=${CODE_SERVER_PORT:-8080},${NOVNC_PORT:-6901},${OMNIROUTE_PORT:-20128}"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
     ports:
-      - "8080:8080"    # code-server
-      - "6901:6080"    # noVNC (host 6901 -> container websockify 6080)
+      - "${BIND_HOST:-127.0.0.1}:${CODE_SERVER_PORT:-8080}:8080"
+      - "${BIND_HOST:-127.0.0.1}:${NOVNC_PORT:-6901}:6080"
+      - "${BIND_HOST:-127.0.0.1}:${OMNIROUTE_PORT:-20128}:${OMNIROUTE_PORT:-20128}"
 
     volumes:
-      - ./workspace:/home/coder/workspace
-      - ./sing-box:/etc/sing-box
+      - ${WORKSPACE_DIR:-./workspace}:/home/coder/workspace
+      - ./sing-box:/etc/sing-box:ro
       - vscode-data:/home/coder/.local/share/code-server
       - chromium-profile:/home/coder/.chromium-profile
-      # WSLg X server socket. This is what makes Chromium open as a separate
-      # window on the Windows desktop instead of only inside noVNC.
-      # The source path exists inside the docker-desktop WSL VM.
-      - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix
+      - claude-state:/home/coder/.claude
+      - omniroute-state:/home/coder/.config/omniroute
+      - singbox-state:/var/lib/sing-box
 
     environment:
-      - PASSWORD=devpassword123
-      # WSLg display. No X socket (Linux host) falls back to Xvfb :99 in
-      # supervisord.conf; on Linux mount /tmp/.X11-unix yourself.
-      - DISPLAY=:0
-      # sing-box runs in TUN mode (config.json has only a TUN inbound).
-      # Do NOT set HTTP_PROXY/HTTPS_PROXY/ALL_PROXY here: those break
-      # apt/curl until TUN is fully up, and Chromium does not need them
-      # because TUN intercepts traffic at the kernel level.
+      - CODE_SERVER_PASSWORD=${CODE_SERVER_PASSWORD:?Set CODE_SERVER_PASSWORD in .env}
+      - VNC_PASSWORD=${VNC_PASSWORD:?Set VNC_PASSWORD in .env}
+      - VPN_SUBSCRIPTION_URL=${VPN_SUBSCRIPTION_URL:-}
+      - VPN_UPDATE_INTERVAL=${VPN_UPDATE_INTERVAL:-3600}
+      - VPN_RETRY_INTERVAL=${VPN_RETRY_INTERVAL:-600}
+      - VPN_ALLOW_INSECURE=${VPN_ALLOW_INSECURE:-0}
+      - VPN_MAX_NODES=${VPN_MAX_NODES:-30}
+      - VPN_MTU=${VPN_MTU:-1280}
+      - VPN_PROBE_NODES=${VPN_PROBE_NODES:-1}
+      - VPN_PROTOCOL_ORDER=${VPN_PROTOCOL_ORDER:-vless,hysteria2}
+      - VPN_NODE_FILTER=${VPN_NODE_FILTER:-}
+      - VPN_NODE_EXCLUDE=${VPN_NODE_EXCLUDE:-}
+      - VPN_FAIL_MODE=${VPN_FAIL_MODE:-strict}
+      - VPN_GUI_NOTIFICATIONS=${VPN_GUI_NOTIFICATIONS:-1}
+      - CHROMIUM_START_URL=${CHROMIUM_START_URL:-http://127.0.0.1:9099}
+      - CHROMIUM_DISABLE_GPU=${CHROMIUM_DISABLE_GPU:-0}
+      - OMNIROUTE_PORT=${OMNIROUTE_PORT:-20128}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}
 
 volumes:
   vscode-data:
-  # Named so the profile survives `docker compose up --build`. A bind-mount
-  # from Windows would put Chrome's SQLite files on the 9p/drvfs path, which
-  # is a known source of browser stalls; the named volume stays inside the VM.
   chromium-profile:
+  claude-state:
+  omniroute-state:
+  singbox-state:

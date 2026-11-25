@@ -1,0 +1,116 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-remote",
+        "type": "tls",
+        "server": "1.1.1.1",
+        "server_port": 853,
+        "detour": "proxy-select"
+      },
+      {
+        "tag": "dns-direct",
+        "type": "https",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query"
+      }
+    ],
+    "final": "dns-remote",
+    "strategy": "ipv4_only"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "sing-tun",
+      "address": [
+        "172.19.0.1/30"
+      ],
+      "mtu": 1400,
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "gvisor",
+      "sniff": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "proxy-select",
+      "outbounds": [
+        "auto-proxy",
+        "example-vless-reality",
+        "direct"
+      ],
+      "default": "auto-proxy"
+    },
+    {
+      "type": "urltest",
+      "tag": "auto-proxy",
+      "outbounds": [
+        "example-vless-reality"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 80,
+      "idle_timeout": "30m"
+    },
+    {
+      "type": "vless",
+      "tag": "example-vless-reality",
+      "server": "YOUR_PROXY_HOST.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "domain_resolver": "dns-direct",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "REPLACE_WITH_REALITY_PUBLIC_KEY",
+          "short_id": "REPLACE_WITH_SHORT_ID"
+        }
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "default_mark": 255,
+    "default_domain_resolver": "dns-direct",
+    "rules": [
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "proxy-select"
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "path": "/var/lib/sing-box/cache.db"
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "REPLACE_AT_RUNTIME"
+    }
+  }
+}

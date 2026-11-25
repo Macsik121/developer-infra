@@ -1,0 +1,44 @@
+# Git & docs
+.git
+.gitignore
+.gitattributes
+README.md
+project-design-rules.md
+
+# Secrets & local runtime files (NEVER bake into Docker image)
+.env
+.env.*
+sing-box/config.json
+sing-box/config.*.json
+sing-box/cache.db
+sing-box/*.db
+sing-box/what-is-my-ip*
+sing-box/sing-box-*/
+
+# Local workspace & tests
+workspace/
+tests/
+scripts/
+*.log
+
+# Standalone AI Studio web console (keep out of Ubuntu dev container build context)
+node_modules/
+dist/
+src/
+public/
+.aistudio/
+.playwright-cli/
+package.json
+package-lock.json
+bun.lock
+tsconfig.json
+vite.config.ts
+index.html
+metadata.json
+
+# OS / Python caches
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
+*.zip

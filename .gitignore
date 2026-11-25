@@ -1,0 +1,37 @@
+# Secrets & local environment
+.env
+.env.*
+!.env.example
+
+# Local sing-box secrets & runtime state (NEVER commit)
+sing-box/config.json
+sing-box/config.*.json
+!sing-box/config.json.example
+sing-box/cache.db
+sing-box/*.db
+sing-box/*.db-journal
+sing-box/*.db-wal
+sing-box/what-is-my-ip*
+sing-box/sing-box-*/
+
+# User workspace & local data
+workspace/
+*.log
+*.pid
+
+# AI Studio web console build / runtime artifacts
+node_modules/
+dist/
+.playwright-cli/
+
+# OS & editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.zip

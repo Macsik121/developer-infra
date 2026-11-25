@@ -1,113 +1,225 @@
-# Instructions to start development
+# developer-infra
 
-Dockerized Ubuntu 24.04 dev box: Chromium (proxied via sing-box TUN), code-server, Claude Code.
+Кроссплатформенная изолированная dev-среда на базе **Ubuntu 24.04** в Docker:
+- **VPN-туннель (`sing-box 1.12` TUN)** с динамическим обновлением подписки (VLESS Reality/gRPC + Hysteria2), балансировкой протоколов, параллельным TCP pre-probe (`SO_MARK=255`), `urltest` + `selector`, и жёстким **IPv4 + IPv6 + Docker DNS (`127.0.0.11`) kill-switch** (`vpn-ctl`).
+- **Встроенный VPN Status Dashboard (`http://127.0.0.1:9099`)** внутри контейнера — стартовая вкладка Chromium с живым статусом `sing-box`, активной нодой, пингом, внешним IP и последними ошибками (без проброса наружу).
+- **Chromium** (нативное окно на Windows через **WSLg** с чистым отключением fallback-демонов, или полностью изолированный **noVNC** на Linux / Hyper-V / удалённых серверах).
+- **code-server** (VS Code в браузере с обязательной аутентификацией).
+- **Изолированный AI-стек (`OmniRoute` + `Claude Code`)** внутри контейнера с персистентными volumes и маршрутизацией всего трафика через `sing-tun`.
 
-## Prerequisites
+---
 
-- Docker Engine + Compose v2 (`docker compose version`)
-- **Windows**: Docker Desktop with WSL2 backend
-- **Linux**: `xhost` (for `x11-xserver-utils`) — not needed for noVNC access, only if you switch to native window later
+## 1. Требования
 
-Install Docker if missing: https://github.com/Macsik121/setup-vpn
+- **Docker Engine + Docker Compose v2** (`docker compose version`).
+- **Windows:** Docker Desktop (WSL2 backend для нативного окна WSLg; либо Hyper-V backend в режиме `headless`).
+- **Linux Desktop / Remote Server:** Docker Engine с доступом к `/dev/net/tun` и `NET_ADMIN`.
 
-## Start
+---
 
+## 2. Быстрый старт
+
+### Шаг 1. Подготовка `.env`
 ```bash
 git clone https://github.com/Macsik121/developer-infra
 cd developer-infra
+cp .env.example .env
 ```
 
-**Windows (PowerShell):**
+Откройте `.env` и обязательно задайте:
+- `CODE_SERVER_PASSWORD` (минимум 6 символов, без `CHANGE_ME` / `devpassword123`);
+- `VNC_PASSWORD` (минимум 6 символов, для входа в noVNC);
+- `VPN_SUBSCRIPTION_URL` — ссылка на динамическую подписку (например, `https://auth.quattro-cloud.ru/...`), либо оставьте пустой для работы от локального `./sing-box/config.json` (шаблон — в `sing-box/config.json.example`).
 
+> **Важно про `VPN_ALLOW_INSECURE`, `VPN_MTU` и `VPN_PROBE_NODES`:**
+> - По умолчанию `VPN_ALLOW_INSECURE=0` — ноды с `insecure=1` / `allowInsecure=1` / self-signed `pcs=` пропускаются (`skipped_insecure=...`). Если часть нод провайдера (например, Hysteria2) использует self-signed сертификаты и вы им доверяете, выставьте `VPN_ALLOW_INSECURE=1`.
+> - `VPN_MTU=1280` гарантирует работу без blackhole-фрагментации, даже если на хосте параллельно включён другой VPN/TUN.
+> - `VPN_PROBE_NODES=1` перед запуском проверяет TCP-доступность до 120 кандидатов (деприоритизируя RU/LTE/мост-ноды) и загружает в `sing-box` рабочие и быстрые ноды.
+
+### Шаг 2. Проверка портов и запуск по платформе
+
+На Windows (особенно с Hyper-V/WinNAT) порты вроде `8080` могут попадать в системный `excludedportrange` (`WSAEACCES`). Перед запуском или автоматически при старте используйте встроенный preflight:
+
+#### Windows (PowerShell, Docker Desktop + WSL2/WSLg)
 ```powershell
-.\run-env.ps1
+# Однократно после распаковки архива снять блокировку Windows MOTW:
+Get-ChildItem -Filter *.ps1 | Unblock-File
+
+# Проверить занятость портов, владельцев и наличие хостового VPN:
+.\run-env.ps1 -CheckPorts
+
+# Запустить (с автоматическим сдвигом +1 при конфликте портов):
+.\run-env.ps1 -AutoPort
+
+# Повторный запуск без пересборки образа:
+.\run-env.ps1 -NoBuild -AutoPort
 ```
 
-**Linux:**
+#### Windows (Hyper-V или без WSLg — только noVNC)
+```powershell
+.\run-env.ps1 -Mode headless -AutoPort
+```
+
+#### Linux Desktop / Удалённый Linux-сервер (изолированный noVNC)
+```bash
+chmod +x run-env.sh vpn-ctl.sh scripts/smoke-test.sh
+./run-env.sh --check-ports
+./run-env.sh --auto-port
+```
+
+#### Удалённый Linux-сервер через SSH-туннель
+Контейнер по умолчанию слушает только `BIND_HOST=127.0.0.1`. Подключайтесь через SSH port-forwarding:
+```bash
+ssh -L 8080:127.0.0.1:8080 -L 6901:127.0.0.1:6901 -L 20128:127.0.0.1:20128 user@remote-server
+```
+
+---
+
+## 3. Доступ к сервисам
+
+| Сервис | Адрес (по умолчанию) | Аутентификация |
+| :--- | :--- | :--- |
+| **code-server (VS Code)** | `http://127.0.0.1:8080` | `CODE_SERVER_PASSWORD` из `.env` |
+| **Chromium (noVNC)** | `http://127.0.0.1:6901/vnc.html` | `VNC_PASSWORD` из `.env` |
+| **OmniRoute UI** | `http://127.0.0.1:20128` | Локальный доступ (`127.0.0.1`) |
+| **VPN Status Dashboard** | `http://127.0.0.1:9099` *(только внутри Chromium/контейнера)* | Read-only (без секретов) |
+
+Стартовая страница Chromium настраивается через `CHROMIUM_START_URL` (по умолчанию `http://127.0.0.1:9099`).
+
+---
+
+## 4. Управление VPN и Kill-Switch (`vpn-ctl`)
+
+Пользователь `coder` (и AI-агент `Claude Code`) **не имеет `sudo`**, не видит секретов из `.env` и не может отключить kill-switch. Внутри контейнера `coder` доступен read-only `vpn-ctl status` (включая активную ноду, задержку, живой IP и последние ошибки). Изменение режимов выполняется **с хоста**:
+
+| Действие | Windows (PowerShell) | Linux / macOS |
+| :--- | :--- | :--- |
+| Статус VPN, активная нода, живой IP | `.\vpn-ctl.ps1 status` | `./vpn-ctl.sh status` |
+| Жёсткий kill-switch (дефолт, TUN) | `.\vpn-ctl.ps1 strict` | `./vpn-ctl.sh strict` |
+| Авто-fallback при падении VPN (TUN) | `.\vpn-ctl.ps1 fallback` | `./vpn-ctl.sh fallback` |
+| Режим прокси без TUN (`127.0.0.1:2080`) | `.\vpn-ctl.ps1 proxy` | `./vpn-ctl.sh proxy` |
+| Прямой выход через сеть/VPN хоста | `.\vpn-ctl.ps1 direct` | `./vpn-ctl.sh direct` |
+| Принудительно обновить подписку + pre-probe | `.\vpn-ctl.ps1 update` | `./vpn-ctl.sh update` |
+| Замерить задержку всех нод (`urltest`) | `.\vpn-ctl.ps1 retest` | `./vpn-ctl.sh retest` |
+| Нумерованный список нод / выбор по номеру | `.\vpn-ctl.ps1 select` / `.\vpn-ctl.ps1 select 2` | `./vpn-ctl.sh select` / `./vpn-ctl.sh select 2` |
+
+> **Совместная работа с VPN на хосте:**
+> - **Независимый VPN контейнера (дефолт `strict`):** контейнер строит собственный `sing-tun` (MTU `1280`, `fwmark 0xff`), полностью независимый от отключений VPN на хосте.
+> - **Если на хосте уже включён VPN и хочется использовать его IP:** выполните `.\vpn-ctl.ps1 direct` (весь трафик контейнера пойдёт через сеть/TUN хоста).
+> - **Только точечный прокси без контейнерного TUN:** выполните `.\vpn-ctl.ps1 proxy` и запускайте браузер через `open-chromium --proxy` (или `HTTP_PROXY=http://127.0.0.1:2080`).
+
+---
+
+## 5. Шпаргалка по ежедневной работе (Day-2 Operations)
+
+| Задача | Команда на хосте |
+| :--- | :--- |
+| Зайти в работающий контейнер как `coder` | `docker compose exec -it -u coder -w /home/coder/workspace ubuntu-dev bash` |
+| Зайти в контейнер с правами `root` *(пароль не нужен — `sudo` удалён для `coder`)* | `docker compose exec -it -u root ubuntu-dev bash` |
+| Посмотреть состояние всех сервисов `supervisord` | `docker compose exec -u root ubuntu-dev supervisorctl status` |
+| Открыть Chromium повторно после закрытия | `docker compose exec -u coder ubuntu-dev open-chromium` *(или `open-chromium --proxy`)* |
+| Посмотреть логи `sing-box` / updater / watchdog | `docker compose exec -u root ubuntu-dev tail -n 50 /var/log/supervisor/sing-box.err.log` |
+| Логи подписки и TCP pre-probe | `docker compose exec -u root ubuntu-dev tail -n 50 /var/log/supervisor/vpn-sub-updater.out.log` |
+| Остановить контейнер *(volumes сохраняются)* | `docker compose down` |
+
+---
+
+## 6. Работа с OmniRoute и Claude Code (изолированно)
+
+Весь AI-стек (`omniroute` + `claude`) работает **только внутри контейнера** под управлением `supervisord`, а его состояние сохраняется в named volumes (`claude-state`, `omniroute-state`).
+
+### Настройка провайдера в OmniRoute
+1. Откройте `http://127.0.0.1:20128` в браузере (или внутри Chromium в контейнере).
+2. Перейдите в **Providers → API Key Compatible Providers → Add OpenAI Compatible Key** (или Anthropic Compatible).
+3. Укажите `prefix`, `provider-id-suffix`, `api type`, `base url` и ваш API-ключ → **Save** → **Retest**.
+4. При необходимости добавьте ключ в `.env` как `ANTHROPIC_AUTH_TOKEN` (либо вводите интерактивно при запуске).
+
+### Запуск Claude Code
+**С Windows (тонкий wrapper — не запускает Node/Claude на хосте):**
+```powershell
+.\start-claude.ps1
+.\start-claude.ps1 -Command "claude" -Model 1
+.\start-claude.ps1 -AddModel
+```
+
+**Внутри контейнера (Linux / code-server терминал):**
+```bash
+start-claude
+start-claude -c "claude" -m 1
+start-claude --add-model
+```
+Реестр моделей хранится в `~/.config/omniroute/claude_models.json` (named volume `omniroute-state`).
+
+---
+
+## 7. Мультиинстансный / мультипользовательский режим
+
+Каждый экземпляр изолируется отдельным `.env` файлом с уникальными `COMPOSE_PROJECT_NAME`, `WORKSPACE_DIR` и портами (или с флагом `--auto-port` / `-AutoPort`):
 
 ```bash
-chmod +x run-env.sh
+cp .env.example .env.dev2
+# Задайте в .env.dev2:
+#   COMPOSE_PROJECT_NAME=devbox-dev2
+#   WORKSPACE_DIR=./workspace-dev2
+#   CODE_SERVER_PORT=8081
+#   NOVNC_PORT=6902
+#   OMNIROUTE_PORT=20129
+#   CPUS=2 / MEM_LIMIT=4g / SHM_SIZE=1g   # пресет Shared Server
 
-./run-env.sh
-
+./run-env.sh --env-file .env.dev2 --detach
+./vpn-ctl.sh --env-file .env.dev2 status
 ```
 
-What this does: `docker compose down` (if exists) → `docker compose up -d --build`.
+> **Заметка для серверов с 15+ контейнерами:** Настройте `default-address-pools` в `/etc/docker/daemon.json`:
+> ```json
+> {
+>   "default-address-pools": [
+>     { "base": "10.200.0.0/16", "size": 24 }
+>   ]
+> }
+> ```
 
-On first run, `sing-box` is installed automatically by `setup-vpn.sh` inside the container. Wait ~30–60 s.
+---
 
-## Access
+## 8. Верификация и тестирование
 
-| Service | URL |
-|---|---|
-| Chromium (via noVNC) | <http://localhost:6901/vnc.html> |
-| code-server | <http://localhost:8080> (password: `devpassword123` — change before exposing externally) |
-
-Chromium is already running inside noVNC when the page loads. Traffic goes through sing-box transparently; do **not** add `--proxy-server`.
-
-### Host window (WSLg)
-
-On Windows, Chromium opens as a **separate window on the desktop** — it draws straight onto WSLg's X server `:0`, which `docker compose` reaches through the `/run/desktop/mnt/host/wslg/.X11-unix` bind. noVNC shows that same desktop, so resizing the host window changes the browser view too.
-
-Requires Docker Desktop with the WSL2 backend and GUI apps (the default). Smoke test — the `TMPDIR` part is required, otherwise `docker exec` mounts a temp dir over `/tmp` and hides the X socket:
-
-```powershell
-MSYS_NO_PATHCONV=1 TMPDIR=$env:TEMP docker exec -e DISPLAY=:0 ubuntu24-dev-box xeyes
-```
-
-If no `X0` socket is mounted, Xvfb on `:99` starts automatically and noVNC still works.
-
-Chromium opens **once**, when the container starts. Closing the window closes it — it does not pop back. To open it again:
-
-```powershell
-docker exec ubuntu24-dev-box open-chromium
-```
-
-or `docker exec ubuntu24-dev-box supervisorctl start chromium`.
-
-**Linux hosts:** use `xhost +local:docker` and bind-mount `/tmp/.X11-unix:/tmp/.X11-unix` instead of the WSLg path.
-
-## Verify
-
+### Автотесты репозитория
+На **Linux / WSL**:
 ```bash
-
-docker exec -it ubuntu24-dev-box bash
-
-supervisorctl status
-
-# sing-box RUNNING, xvfb RUNNING, code-server RUNNING, chromium RUNNING
-
-ip a show sing-tun          # TUN interface UP
-
-curl -s https://ipinfo.io   # should show proxy IP, not your real one
-
+python3 -m unittest discover -s tests -v
+```
+На **Windows (PowerShell)**:
+- Быстрый прогон (автоматически пропускает POSIX bash-тесты): `python -m unittest discover -s tests -v`
+- Полный 100% прогон **включая POSIX-скрипты** внутри собранного образа:
+```powershell
+docker run --rm --entrypoint "" -v "${PWD}:/repo:ro" -w /repo devbox-main-ubuntu-dev:latest python3 -m unittest discover -s tests -v
 ```
 
-If `curl` shows your real IP, sing-box is down — see Troubleshooting.
-
-## Manual scripts (optional, in `/etc/sing-box/`)
-
-- `test-connection.sh` — prints current egress IP through sing-box.
-- `start-claude.sh` — launches Claude Code configured for the Omniroute provider.
-&#x20; Requires `OMNIROUTE_API_KEY` to be set in the container (e.g. via `docker exec -e OMNIROUTE_API_KEY=... ubuntu24-dev-box bash`).
-
-`setup-vpn.sh` runs automatically — **do not run it manually** unless sing-box is stuck; see Troubleshooting.
-
-## Troubleshooting
-
-- **`chromium: no internet` in noVNC** → `docker exec -it ubuntu24-dev-box bash`, then `curl -s https://ipinfo.io`. If that fails, sing-box is down:
-
+### Живой Smoke-Test после запуска контейнера
 ```bash
-
-supervisorctl status
-tail -n 50 /var/log/supervisor/sing-box.err.log
-
+./scripts/smoke-test.sh
+# С активной проверкой блокировки IPv4 + Docker DNS (127.0.0.11) при остановке sing-box:
+./scripts/smoke-test.sh --test-killswitch
 ```
 
-- **`http://localhost:6901` shows a directory listing instead of the browser** → the URL is missing the client page. Open <http://localhost:6901/vnc.html>. The image ships an `index.html` that redirects there, so a bare `/` works too after a rebuild.
+---
 
-- **noVNC shows black screen** → `supervisorctl status xvfb fluxbox x11vnc`. Restart with `supervisorctl restart xvfb`.
+## 9. Troubleshooting
 
-- **`setup-vpn.sh` failed at first start** (404, network) → exec into the container, fix `VERSION=` in `/etc/sing-box/setup-vpn.sh`, then `supervisorctl restart sing-box`.
-
-- **Container recreates and loses everything** → expected; mount `./workspace` for persistent data.
+- **Нет интернета при поднятом `sing-tun` (`DEGRADED_NO_EGRESS`):**
+  1. Выполните `.\vpn-ctl.ps1 status` — проверьте `Reachable` и `Recent Errors`.
+  2. Прогоните `.\vpn-ctl.ps1 retest` и `.\vpn-ctl.ps1 select` → выберите рабочую ноду по номеру (`.\vpn-ctl.ps1 select 2`).
+  3. Запустите `.\vpn-ctl.ps1 update` — TCP pre-probe автоматически отсеет недоступные ноды и выберет рабочие.
+  4. Если в логе `skipped_insecure > 0`, установите `VPN_ALLOW_INSECURE=1` в `.env` и перезапустите контейнер.
+- **Конфликт портов / `WSAEACCES` на Windows (`bind: An attempt was made to access a socket in a way forbidden`):**
+  - Запустите `.\run-env.ps1 -CheckPorts`, чтобы увидеть точную причину (процесс, другой контейнер `developer-infra` или `WinNAT excludedportrange`), и запускайте через `.\run-env.ps1 -AutoPort`.
+- **Ошибка `KILLSWITCH_ERROR` в статусе:** ядро хоста не поддерживает `xt_mark`. Обновите ядро WSL2 (`wsl --update`) или временно переключитесь на `direct`.
+- **Чёрный экран в noVNC или медленный Chromium под WSLg:**
+  - Убедитесь, что для Windows WSL2 используется `docker-compose.wslg.yaml` (дефолт `run-env.ps1`), а для Hyper-V/Linux — `docker-compose.headless.yaml` (`-Mode headless` / дефолт `run-env.sh`).
+  - Для WSLg (`:0`) сервисы `xvfb`/`fluxbox`/`x11vnc`/`novnc` намеренно завершаются со статусом `EXITED` (это норма, не ошибка).
+  - Если Chromium грузит CPU под WSLg, задайте `CHROMIUM_DISABLE_GPU=1` в `.env`.
+- **Проверка конфигурации Compose перед запуском:**
+  ```bash
+  docker compose -f docker-compose.yaml -f docker-compose.wslg.yaml config
+  docker compose -f docker-compose.yaml -f docker-compose.headless.yaml config
+  ```

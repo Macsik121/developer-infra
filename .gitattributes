@@ -1,0 +1,14 @@
+# Enforce consistent line endings across Windows (WSL2/PowerShell) and Linux
+* text=auto
+
+# Container & Linux shell/Python scripts MUST stay LF
+*.sh text eol=lf
+*.py text eol=lf
+Dockerfile text eol=lf
+supervisord.conf text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+
+# Windows PowerShell scripts
+*.ps1 text eol=crlf

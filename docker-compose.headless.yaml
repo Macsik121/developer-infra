@@ -1,0 +1,10 @@
+# Headless / noVNC-only isolated overlay (D1)
+# Use on Linux Desktop (without host X11 exposure), remote Linux servers,
+# Windows Hyper-V backend, or when running untrusted AI agent workloads.
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.headless.yaml up -d --build
+services:
+  ubuntu-dev:
+    tmpfs:
+      - /tmp/.X11-unix:size=16m
+    environment:
+      - DISPLAY=:99

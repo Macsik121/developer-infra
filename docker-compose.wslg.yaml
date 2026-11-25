@@ -1,0 +1,6 @@
+# Windows Docker Desktop (WSL2 + WSLg) overlay (D1)
+# Usage: docker compose -f docker-compose.yaml -f docker-compose.wslg.yaml up -d --build
+services:
+  ubuntu-dev:
+    volumes:
+      - /run/desktop/mnt/host/wslg/.X11-unix:/tmp/.X11-unix

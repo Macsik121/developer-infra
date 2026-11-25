@@ -1,0 +1,1032 @@
+#!/usr/bin/env python3
+"""
+Dynamic sing-box 1.12 subscription updater for developer-infra (D5, F7, F8, Patch v2.1).
+
+Features:
+- Parses plain or base64 URI lists containing vless:// (TCP Reality, gRPC TLS)
+  and hysteria2:// (obfs, alpn, sni, insecure) links.
+- Enforces 5 MB download cap, 15s timeout, SSRF host filtering, deduplication,
+  VPN_ALLOW_INSECURE=0 default (treating vless `pcs=` pinned self-signed certs
+  under the same policy), RU/bridge deprioritization, balanced multi-protocol
+  selection, optional parallel TCP reachability pre-probe (SO_MARK=255),
+  regex include/exclude filters, and VPN_MAX_NODES=30 cap.
+- Preserves Chesterton's Fence invariants: stack="gvisor", configurable MTU
+  (default 1280 for nested-VPN safety), route.default_mark=255, internal
+  127.0.0.1:2080 mixed proxy inbound (and proxy-only mode without tun-in),
+  cache_file="/var/lib/sing-box/cache.db", and authenticated Clash API.
+- Validates candidate configs atomically via `sing-box check` before swapping,
+  with 3-step cold-start fallback (subscription -> last-good -> static config).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import concurrent.futures
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+MAX_SUB_BYTES = 5 * 1024 * 1024  # 5 MB cap (ST-5)
+FETCH_TIMEOUT = 15  # seconds
+SO_MARK = 36  # Linux socket option for fwmark (0xff = 255)
+DEFAULT_FWMARK = 255
+
+# RU/BY mobile/bridge nodes commonly drop TCP SYN when reached through another VPN/foreign IP.
+LOW_PRIORITY_TAG_RE = re.compile(
+    r"(lte\s*авто|мост|россия|беларусь|\bru\b|\bby\b|mobile|whitelist)",
+    re.IGNORECASE,
+)
+
+RUN_VPN_DIR = os.environ.get("DEV_INFRA_RUN_DIR", "/run") + "/vpn"
+STATE_DIR = os.environ.get("DEV_INFRA_SINGBOX_STATE_DIR", "/var/lib/sing-box")
+ETC_SINGBOX_DIR = os.environ.get("DEV_INFRA_ETC_SINGBOX_DIR", "/etc/sing-box")
+SING_BOX_BIN = os.environ.get("SING_BOX_BIN", "/usr/local/bin/sing-box")
+VPN_CTL_BIN = os.environ.get("VPN_CTL_BIN", "/usr/local/bin/vpn-ctl")
+
+
+def log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [vpn-sub-updater] {msg}", flush=True)
+
+
+def redact_url(url: str) -> str:
+    """Redact credentials, path tokens, and query parameters from subscription URLs."""
+    try:
+        parsed = urllib.parse.urlsplit(url.strip())
+        if not parsed.scheme or not parsed.hostname:
+            return "<redacted-url>"
+        port_part = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{parsed.hostname}{port_part}/<redacted>"
+    except Exception:
+        return "<redacted-url>"
+
+
+def is_truthy(val: Optional[str]) -> bool:
+    if val is None:
+        return False
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_ssrf_host(host: str) -> bool:
+    """Reject loopback, unspecified, link-local, and localhost targets (ST-5)."""
+    if not host:
+        return True
+    cleaned = host.strip().lower().strip("[]")
+    if cleaned in {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}:
+        return True
+    if cleaned.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(cleaned)
+        if ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip.is_multicast:
+            return True
+    except ValueError:
+        if any(ch.isspace() or ord(ch) < 32 for ch in cleaned):
+            return True
+    return False
+
+
+def decode_subscription_payload(raw_bytes: bytes) -> List[str]:
+    """Decode plain URI list or base64-encoded URI list into raw URI lines."""
+    text = raw_bytes.decode("utf-8", errors="ignore").strip()
+    if not text:
+        return []
+
+    def extract_uris(content: str) -> List[str]:
+        return [
+            line.strip()
+            for line in content.splitlines()
+            if line.strip() and "://" in line and not line.strip().startswith("#")
+        ]
+
+    direct_lines = extract_uris(text)
+    if direct_lines:
+        return direct_lines
+
+    compact = re.sub(r"\s+", "", text)
+    padding = (-len(compact)) % 4
+    padded = compact + ("=" * padding)
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            decoded = decoder(padded).decode("utf-8", errors="ignore")
+            lines = extract_uris(decoded)
+            if lines:
+                return lines
+        except Exception:
+            continue
+    return []
+
+
+def sanitize_tag(raw_tag: str, fallback: str) -> str:
+    tag = urllib.parse.unquote(raw_tag or "").strip()
+    tag = re.sub(r"[\r\n\t]+", " ", tag)
+    tag = re.sub(r"[^\w\-\.\s\(\)\[\]/:+@]+", "", tag)
+    tag = re.sub(r"\s+", " ", tag).strip()
+    return tag[:64] if tag else fallback
+
+
+def is_low_priority_tag(tag: str) -> bool:
+    return bool(LOW_PRIORITY_TAG_RE.search(tag or ""))
+
+
+def parse_vless_uri(
+    uri: str, allow_insecure: bool, stats: Dict[str, int]
+) -> Optional[Dict[str, Any]]:
+    """
+    Parse vless:// URIs matching observed F8 signatures:
+    1. TCP + Reality: [encryption,flow,fp,headerType,pbk,security,sid,sni,type]
+    2. gRPC + TLS + pcs (pinned self-signed cert SHA256): [encryption,fp,mode,pcs,security,serviceName,sni,type]
+    3. gRPC + TLS + allowInsecure: [allowInsecure,encryption,fp,mode,security,serviceName,sni,type]
+    """
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+    except ValueError:
+        stats["skipped_invalid"] += 1
+        return None
+
+    uuid = urllib.parse.unquote(parsed.username or "").strip()
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        stats["skipped_invalid"] += 1
+        return None
+
+    if not uuid or not host or not (1 <= port <= 65535):
+        stats["skipped_invalid"] += 1
+        return None
+    if is_ssrf_host(host):
+        stats["skipped_ssrf"] += 1
+        return None
+
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items()}
+    security = (q.get("security") or "").strip().lower()
+    net_type = (q.get("type") or "tcp").strip().lower()
+    sni = (q.get("sni") or host).strip()
+    fp = (q.get("fp") or "").strip()
+    flow = (q.get("flow") or "").strip()
+    pbk = (q.get("pbk") or "").strip()
+    sid = (q.get("sid") or "").strip()
+    pcs = (q.get("pcs") or "").strip()
+    service_name = (q.get("serviceName") or q.get("path") or "").strip()
+
+    # Non-empty `pcs` indicates a self-signed cert pin (Xray-specific); sing-box 1.12
+    # cannot verify it via system CA without tls.insecure, so treat under allow_insecure.
+    insecure_flag = (
+        is_truthy(q.get("allowInsecure"))
+        or is_truthy(q.get("insecure"))
+        or (security == "tls" and bool(pcs))
+    )
+
+    if insecure_flag and not allow_insecure:
+        stats["skipped_insecure"] += 1
+        return None
+
+    tag = sanitize_tag(parsed.fragment, f"vless-{host}-{port}")
+    outbound: Dict[str, Any] = {
+        "type": "vless",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "uuid": uuid,
+        "domain_resolver": "dns-direct",
+    }
+
+    if flow and net_type == "tcp":
+        outbound["flow"] = flow
+
+    if security in {"tls", "reality"}:
+        tls_cfg: Dict[str, Any] = {
+            "enabled": True,
+            "server_name": sni,
+        }
+        if fp:
+            tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
+        if security == "reality":
+            if not pbk:
+                stats["skipped_invalid"] += 1
+                return None
+            reality_cfg: Dict[str, Any] = {
+                "enabled": True,
+                "public_key": pbk,
+            }
+            if sid:
+                reality_cfg["short_id"] = sid
+            tls_cfg["reality"] = reality_cfg
+        elif insecure_flag and allow_insecure:
+            tls_cfg["insecure"] = True
+        outbound["tls"] = tls_cfg
+
+    if net_type == "grpc":
+        transport: Dict[str, Any] = {"type": "grpc"}
+        if service_name:
+            transport["service_name"] = service_name
+        outbound["transport"] = transport
+    elif net_type == "ws":
+        transport = {"type": "ws"}
+        if q.get("path"):
+            transport["path"] = q["path"]
+        if q.get("host"):
+            transport["headers"] = {"Host": q["host"]}
+        outbound["transport"] = transport
+    elif net_type not in {"tcp", ""}:
+        stats["skipped_unsupported"] += 1
+        return None
+
+    return outbound
+
+
+def parse_hysteria2_uri(
+    uri: str, allow_insecure: bool, stats: Dict[str, int]
+) -> Optional[Dict[str, Any]]:
+    """
+    Parse hysteria2:// (or hy2://) URIs matching observed F8 signatures:
+    - [alpn,insecure,obfs,obfs-password,sni]
+    - [insecure,obfs,obfs-password,sni]
+    - [alpn,insecure,sni]
+    """
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+    except ValueError:
+        stats["skipped_invalid"] += 1
+        return None
+
+    password = urllib.parse.unquote(parsed.username or "").strip()
+    if parsed.password:
+        password = f"{password}:{urllib.parse.unquote(parsed.password)}"
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port or 443
+    except ValueError:
+        stats["skipped_invalid"] += 1
+        return None
+
+    if not password or not host or not (1 <= port <= 65535):
+        stats["skipped_invalid"] += 1
+        return None
+    if is_ssrf_host(host):
+        stats["skipped_ssrf"] += 1
+        return None
+
+    q = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items()}
+    sni = (q.get("sni") or host).strip()
+    alpn_raw = (q.get("alpn") or "").strip()
+    obfs_type = (q.get("obfs") or "").strip()
+    obfs_pass = (q.get("obfs-password") or "").strip()
+    insecure_flag = is_truthy(q.get("insecure")) or is_truthy(q.get("allowInsecure"))
+
+    if insecure_flag and not allow_insecure:
+        stats["skipped_insecure"] += 1
+        return None
+
+    tag = sanitize_tag(parsed.fragment, f"hy2-{host}-{port}")
+    tls_cfg: Dict[str, Any] = {
+        "enabled": True,
+        "server_name": sni,
+    }
+    if alpn_raw:
+        alpn_list = [item.strip() for item in alpn_raw.split(",") if item.strip()]
+        if alpn_list:
+            tls_cfg["alpn"] = alpn_list
+    if insecure_flag and allow_insecure:
+        tls_cfg["insecure"] = True
+
+    outbound: Dict[str, Any] = {
+        "type": "hysteria2",
+        "tag": tag,
+        "server": host,
+        "server_port": port,
+        "password": password,
+        "domain_resolver": "dns-direct",
+        "tls": tls_cfg,
+    }
+
+    if obfs_type:
+        outbound["obfs"] = {
+            "type": obfs_type,
+            "password": obfs_pass,
+        }
+
+    return outbound
+
+
+def _select_balanced_nodes(
+    parsed_nodes: List[Dict[str, Any]],
+    protocol_order: List[str],
+    max_nodes: int,
+) -> List[Dict[str, Any]]:
+    """
+    Order nodes by priority (standard international nodes before RU/LTE/bridge nodes)
+    and select a balanced mix across available protocols in protocol_order:
+    - Primary protocol gets at least 70% of slots (when available).
+    - Secondary protocols get up to 30% of slots (min 1 each if max_nodes >= 3),
+      so both VLESS (TCP) and Hysteria2 (UDP/QUIC) are present in the active pool.
+    """
+    cap = max(1, max_nodes)
+    order = [p.strip().lower() for p in protocol_order if p.strip()]
+    if not order:
+        order = ["vless", "hysteria2"]
+
+    buckets: Dict[str, List[Dict[str, Any]]] = {p: [] for p in order}
+    other: List[Dict[str, Any]] = []
+    for node in parsed_nodes:
+        proto = node["type"]
+        if proto in buckets:
+            buckets[proto].append(node)
+        else:
+            other.append(node)
+
+    # Stable sort within each protocol bucket: normal nodes first, RU/bridge/LTE last
+    for proto in buckets:
+        buckets[proto].sort(key=lambda n: 1 if is_low_priority_tag(n["tag"]) else 0)
+    other.sort(key=lambda n: 1 if is_low_priority_tag(n["tag"]) else 0)
+
+    present_protos = [p for p in order if buckets[p]]
+    if not present_protos:
+        return other[:cap]
+
+    if len(present_protos) == 1 or cap < 3:
+        combined: List[Dict[str, Any]] = []
+        for p in present_protos:
+            combined.extend(buckets[p])
+        combined.extend(other)
+        return combined[:cap]
+
+    primary = present_protos[0]
+    secondaries = present_protos[1:]
+    sec_budget_total = max(1, int(cap * 0.30))
+    sec_selected: List[Dict[str, Any]] = []
+
+    # Round-robin pick from secondary protocols up to secondary budget
+    sec_cursors = {p: 0 for p in secondaries}
+    while len(sec_selected) < sec_budget_total:
+        progressed = False
+        for p in secondaries:
+            if len(sec_selected) >= sec_budget_total:
+                break
+            idx = sec_cursors[p]
+            if idx < len(buckets[p]):
+                sec_selected.append(buckets[p][idx])
+                sec_cursors[p] = idx + 1
+                progressed = True
+        if not progressed:
+            break
+
+    primary_budget = cap - len(sec_selected)
+    prim_selected = buckets[primary][:primary_budget]
+    selected = prim_selected + sec_selected
+
+    # Fill any remaining slots if primary had fewer nodes than its budget
+    if len(selected) < cap:
+        leftovers: List[Dict[str, Any]] = []
+        leftovers.extend(buckets[primary][len(prim_selected):])
+        for p in secondaries:
+            leftovers.extend(buckets[p][sec_cursors[p]:])
+        leftovers.extend(other)
+        selected.extend(leftovers[: cap - len(selected)])
+
+    return selected[:cap]
+
+
+def _assign_unique_tags(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    used_tags = {"proxy-select", "auto-proxy", "direct"}
+    for node in nodes:
+        base_tag = node["tag"]
+        candidate = base_tag
+        suffix = 2
+        while candidate in used_tags:
+            candidate = f"{base_tag}-{suffix}"
+            suffix += 1
+        node["tag"] = candidate
+        used_tags.add(candidate)
+    return nodes
+
+
+def parse_subscription_uris(
+    uris: List[str],
+    allow_insecure: bool = False,
+    node_filter: str = "",
+    node_exclude: str = "",
+    protocol_order: Optional[List[str]] = None,
+    max_nodes: int = 30,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Parse, validate, filter, deduplicate, prioritize, balance, and cap subscription URIs."""
+    stats: Dict[str, int] = {
+        "total_uris": len(uris),
+        "parsed": 0,
+        "skipped_insecure": 0,
+        "skipped_ssrf": 0,
+        "skipped_invalid": 0,
+        "skipped_unsupported": 0,
+        "skipped_filtered": 0,
+        "skipped_duplicate": 0,
+        "selected": 0,
+    }
+
+    inc_re = re.compile(node_filter, re.IGNORECASE) if node_filter.strip() else None
+    exc_re = re.compile(node_exclude, re.IGNORECASE) if node_exclude.strip() else None
+
+    seen_keys = set()
+    parsed_nodes: List[Dict[str, Any]] = []
+
+    for uri in uris:
+        scheme = uri.split("://", 1)[0].strip().lower()
+        node: Optional[Dict[str, Any]] = None
+        if scheme == "vless":
+            node = parse_vless_uri(uri, allow_insecure, stats)
+        elif scheme in {"hysteria2", "hy2"}:
+            node = parse_hysteria2_uri(uri, allow_insecure, stats)
+        else:
+            stats["skipped_unsupported"] += 1
+            continue
+
+        if node is None:
+            continue
+
+        stats["parsed"] += 1
+        tag = node["tag"]
+
+        if inc_re and not inc_re.search(tag):
+            stats["skipped_filtered"] += 1
+            continue
+        if exc_re and exc_re.search(tag):
+            stats["skipped_filtered"] += 1
+            continue
+
+        dedup_key = (
+            node["type"],
+            node["server"].lower(),
+            node["server_port"],
+            node.get("uuid") or node.get("password") or "",
+            (node.get("tls") or {}).get("server_name", ""),
+            (node.get("transport") or {}).get("service_name", ""),
+        )
+        if dedup_key in seen_keys:
+            stats["skipped_duplicate"] += 1
+            continue
+        seen_keys.add(dedup_key)
+        parsed_nodes.append(node)
+
+    order = [p.strip().lower() for p in (protocol_order or ["vless", "hysteria2"]) if p.strip()]
+    capped = _select_balanced_nodes(parsed_nodes, order, max_nodes=max_nodes)
+    _assign_unique_tags(capped)
+
+    stats["selected"] = len(capped)
+    return capped, stats
+
+
+def _probe_single_node(node: Dict[str, Any], timeout: float = 1.5, fwmark: int = DEFAULT_FWMARK) -> Tuple[bool, float]:
+    """
+    Verify upstream reachability using SO_MARK=255 so probes bypass sing-tun.
+    - TCP protocols (vless): real TCP connect handshake.
+    - UDP protocols (hysteria2): verify IP/DNS resolvability (cannot TCP-probe QUIC).
+    """
+    host = node["server"]
+    port = int(node["server_port"])
+    t0 = time.monotonic()
+
+    if node["type"] == "hysteria2":
+        try:
+            socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+            return True, (time.monotonic() - t0) * 1000.0
+        except OSError:
+            return False, 9999.0
+
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return False, 9999.0
+
+    for family, socktype, proto, _, sockaddr in infos[:2]:
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, SO_MARK, fwmark)
+            except OSError:
+                pass
+            sock.connect(sockaddr)
+            return True, (time.monotonic() - t0) * 1000.0
+        except OSError:
+            continue
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return False, 9999.0
+
+
+def probe_reachable_nodes(
+    candidates: List[Dict[str, Any]],
+    protocol_order: List[str],
+    max_nodes: int = 30,
+    timeout: float = 1.5,
+    max_workers: int = 24,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """
+    Probe up to 120 prioritized candidates in parallel and pick the fastest reachable nodes
+    preserving protocol balance. Falls back to unprobed list if 0 succeed.
+    Returns (selected_nodes, probed_count, reachable_count).
+    """
+    if not candidates:
+        return [], 0, 0
+
+    probe_pool = candidates[: min(len(candidates), max(max_nodes * 4, 120))]
+    results: List[Tuple[Dict[str, Any], float]] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(probe_pool))) as pool:
+        future_map = {pool.submit(_probe_single_node, node, timeout): node for node in probe_pool}
+        for fut in concurrent.futures.as_completed(future_map):
+            node = future_map[fut]
+            try:
+                ok, rtt_ms = fut.result()
+                if ok:
+                    results.append((node, rtt_ms))
+            except Exception:
+                continue
+
+    if not results:
+        fallback = _select_balanced_nodes(candidates, protocol_order, max_nodes=max_nodes)
+        return _assign_unique_tags(fallback), len(probe_pool), 0
+
+    # Sort reachable nodes by (low_priority_flag, rtt_ms)
+    results.sort(key=lambda item: (1 if is_low_priority_tag(item[0]["tag"]) else 0, item[1]))
+    reachable_nodes = [item[0] for item in results]
+    selected = _select_balanced_nodes(reachable_nodes, protocol_order, max_nodes=max_nodes)
+    _assign_unique_tags(selected)
+    return selected, len(probe_pool), len(reachable_nodes)
+
+
+def build_singbox_config(
+    nodes: List[Dict[str, Any]],
+    clash_secret: str,
+    cache_path: str = "/var/lib/sing-box/cache.db",
+    mtu: int = 1280,
+    proxy_only: bool = False,
+) -> Dict[str, Any]:
+    """Build modern sing-box 1.12 configuration preserving all F7/D5/D6/v2.1 invariants."""
+    if not nodes:
+        raise ValueError("Cannot build sing-box config with zero valid proxy nodes")
+
+    safe_mtu = max(1200, min(1500, int(mtu)))
+    node_tags = [n["tag"] for n in nodes]
+    outbounds: List[Dict[str, Any]] = [
+        {
+            "type": "selector",
+            "tag": "proxy-select",
+            "outbounds": ["auto-proxy", *node_tags, "direct"],
+            "default": "auto-proxy",
+        },
+        {
+            "type": "urltest",
+            "tag": "auto-proxy",
+            "outbounds": node_tags,
+            "url": "https://www.gstatic.com/generate_204",
+            "interval": "1m",
+            "tolerance": 80,
+            "idle_timeout": "30m",
+        },
+        *nodes,
+        {
+            "type": "direct",
+            "tag": "direct",
+            "routing_mark": DEFAULT_FWMARK,
+        },
+    ]
+
+    inbounds: List[Dict[str, Any]] = []
+    if not proxy_only:
+        inbounds.append(
+            {
+                "type": "tun",
+                "tag": "tun-in",
+                "interface_name": "sing-tun",
+                "address": ["172.19.0.1/30"],
+                "mtu": safe_mtu,
+                "auto_route": True,
+                "strict_route": True,
+                "stack": "gvisor",
+                "sniff": True,
+            }
+        )
+
+    # Always expose an internal loopback mixed HTTP/SOCKS5 proxy inside the container
+    # (never published to host, zero conflict with host port 2080).
+    inbounds.append(
+        {
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": 2080,
+            "sniff": True,
+        }
+    )
+
+    return {
+        "log": {
+            "level": "info",
+            "timestamp": True,
+        },
+        "dns": {
+            "servers": [
+                {
+                    "tag": "dns-remote",
+                    "type": "tls",
+                    "server": "1.1.1.1",
+                    "server_port": 853,
+                    "detour": "proxy-select",
+                },
+                {
+                    "tag": "dns-direct",
+                    "type": "https",
+                    "server": "1.1.1.1",
+                    "server_port": 443,
+                    "path": "/dns-query",
+                },
+            ],
+            "final": "dns-remote",
+            "strategy": "ipv4_only",
+        },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": {
+            "auto_detect_interface": True,
+            "default_mark": DEFAULT_FWMARK,
+            "default_domain_resolver": "dns-direct",
+            "rules": [
+                {
+                    "protocol": "dns",
+                    "action": "hijack-dns",
+                },
+                {
+                    "ip_is_private": True,
+                    "outbound": "direct",
+                },
+            ],
+            "final": "proxy-select",
+        },
+        "experimental": {
+            "cache_file": {
+                "enabled": True,
+                "path": cache_path,
+            },
+            "clash_api": {
+                "external_controller": "127.0.0.1:9090",
+                "secret": clash_secret,
+            },
+        },
+    }
+
+
+def harden_static_config(
+    raw_cfg: Dict[str, Any],
+    clash_secret: str,
+    cache_path: str = "/var/lib/sing-box/cache.db",
+) -> Dict[str, Any]:
+    """
+    Sanitize fallback static /etc/sing-box/config.json:
+    - Drops broken empty-tag outbounds (like F7's outbounds[2]).
+    - Enforces route.default_mark=255, cache_file in /var/lib/sing-box, and Clash API secret.
+    """
+    cfg = json.loads(json.dumps(raw_cfg))
+
+    outbounds = cfg.get("outbounds", [])
+    if isinstance(outbounds, list):
+        cleaned = [ob for ob in outbounds if isinstance(ob, dict) and ob.get("tag")]
+        for ob in cleaned:
+            if ob.get("type") == "direct":
+                ob["routing_mark"] = DEFAULT_FWMARK
+        cfg["outbounds"] = cleaned
+
+    route = cfg.setdefault("route", {})
+    route["auto_detect_interface"] = True
+    route["default_mark"] = DEFAULT_FWMARK
+
+    exp = cfg.setdefault("experimental", {})
+    exp["cache_file"] = {"enabled": True, "path": cache_path}
+    exp["clash_api"] = {
+        "external_controller": "127.0.0.1:9090",
+        "secret": clash_secret,
+    }
+    return cfg
+
+
+def fetch_subscription_bytes(url: str, max_bytes: int = MAX_SUB_BYTES, timeout: int = FETCH_TIMEOUT) -> bytes:
+    """Download subscription payload with strict size cap and timeout."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"Unsupported subscription scheme: {parsed.scheme}")
+    if is_ssrf_host(parsed.hostname or ""):
+        raise ValueError("Subscription URL points to a blocked local/SSRF host")
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "sing-box/1.12.8 (developer-infra)",
+            "Accept": "text/plain, */*",
+        },
+    )
+    chunks: List[bytes] = []
+    total = 0
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f"Subscription payload exceeded {max_bytes} byte limit")
+            chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def validate_config_with_singbox(config_path: str, sing_box_bin: str = SING_BOX_BIN) -> Tuple[bool, str]:
+    """Run `sing-box check -c <config_path>` before swapping active config."""
+    try:
+        res = subprocess.run(
+            [sing_box_bin, "check", "-c", config_path],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if res.returncode == 0:
+            return True, ""
+        return False, (res.stderr or res.stdout).strip()
+    except Exception as exc:
+        return False, str(exc)
+
+
+def read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def write_secure_json(path: str, data: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def file_sha256(path: str) -> str:
+    if not os.path.isfile(path):
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def atomic_apply_config(
+    cfg: Dict[str, Any],
+    state_dir: str = STATE_DIR,
+    sing_box_bin: str = SING_BOX_BIN,
+    save_last_good: bool = True,
+) -> Tuple[bool, bool, str]:
+    """
+    Validate and atomically replace config.active.json.
+    Returns: (success, changed, error_message)
+    """
+    new_path = os.path.join(state_dir, "config.new.json")
+    active_path = os.path.join(state_dir, "config.active.json")
+    last_good_path = os.path.join(state_dir, "config.last-good.json")
+
+    write_secure_json(new_path, cfg)
+    ok, err = validate_config_with_singbox(new_path, sing_box_bin=sing_box_bin)
+    if not ok:
+        try:
+            os.remove(new_path)
+        except OSError:
+            pass
+        return False, False, err
+
+    old_hash = file_sha256(active_path)
+    new_hash = file_sha256(new_path)
+    changed = old_hash != new_hash
+
+    os.replace(new_path, active_path)
+    os.chmod(active_path, 0o600)
+    if save_last_good:
+        write_secure_json(last_good_path, cfg)
+
+    return True, changed, ""
+
+
+def restart_singbox() -> None:
+    try:
+        res = subprocess.run(
+            ["supervisorctl", "restart", "sing-box"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if res.returncode == 0:
+            log("Reloaded sing-box via supervisorctl")
+        else:
+            log(f"supervisorctl restart sing-box returned {res.returncode}: {res.stderr.strip()}")
+    except Exception as exc:
+        log(f"Could not restart sing-box automatically: {exc}")
+
+
+def run_bootstrap_cmd(action: str, arg: Optional[str] = None) -> None:
+    if not os.path.exists(VPN_CTL_BIN):
+        return
+    cmd = [VPN_CTL_BIN, action]
+    if arg:
+        cmd.append(arg)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
+def perform_update(cold_start: bool = False) -> bool:
+    sub_url = read_text_file(os.path.join(RUN_VPN_DIR, "subscription_url"))
+    clash_secret = read_text_file(os.path.join(RUN_VPN_DIR, "clash_secret")) or "dev-infra-secret"
+    current_mode = read_text_file(os.path.join(RUN_VPN_DIR, "mode")) or "strict"
+    proxy_only = current_mode == "proxy"
+
+    active_path = os.path.join(STATE_DIR, "config.active.json")
+    last_good_path = os.path.join(STATE_DIR, "config.last-good.json")
+    static_path = os.path.join(ETC_SINGBOX_DIR, "config.json")
+
+    allow_insecure = is_truthy(os.environ.get("VPN_ALLOW_INSECURE", "0"))
+    probe_enabled = is_truthy(os.environ.get("VPN_PROBE_NODES", "1"))
+    node_filter = os.environ.get("VPN_NODE_FILTER", "")
+    node_exclude = os.environ.get("VPN_NODE_EXCLUDE", "")
+    protocol_order = [
+        p.strip() for p in os.environ.get("VPN_PROTOCOL_ORDER", "vless,hysteria2").split(",")
+    ]
+    try:
+        max_nodes = int(os.environ.get("VPN_MAX_NODES", "30"))
+    except ValueError:
+        max_nodes = 30
+    try:
+        mtu = int(os.environ.get("VPN_MTU", "1280"))
+    except ValueError:
+        mtu = 1280
+
+    # Step 1: Attempt dynamic subscription fetch
+    if sub_url:
+        redacted = redact_url(sub_url)
+        sub_host = urllib.parse.urlsplit(sub_url).hostname or ""
+        bootstrap_opened = False
+        try:
+            if cold_start and sub_host and not os.path.isfile(active_path):
+                log(f"Cold-start bootstrap: temporarily allowing HTTPS to {sub_host}")
+                run_bootstrap_cmd("bootstrap-allow", sub_host)
+                bootstrap_opened = True
+
+            log(f"Fetching subscription from {redacted}")
+            raw_bytes = fetch_subscription_bytes(sub_url)
+            uris = decode_subscription_payload(raw_bytes)
+
+            # Parse a wide pool first so TCP pre-probe can filter out unreachable RU/bridge nodes
+            pool_cap = max(max_nodes * 4, 120) if probe_enabled else max_nodes
+            candidates, stats = parse_subscription_uris(
+                uris,
+                allow_insecure=allow_insecure,
+                node_filter=node_filter,
+                node_exclude=node_exclude,
+                protocol_order=protocol_order,
+                max_nodes=pool_cap,
+            )
+
+            if probe_enabled and candidates:
+                nodes, probed_n, reachable_n = probe_reachable_nodes(
+                    candidates,
+                    protocol_order=protocol_order,
+                    max_nodes=max_nodes,
+                )
+                log(
+                    f"TCP pre-probe: probed={probed_n} reachable={reachable_n} "
+                    f"selected={len(nodes)} (mode={current_mode}, mtu={mtu})"
+                )
+            else:
+                nodes = candidates[:max_nodes]
+
+            log(
+                f"Parsed subscription: total={stats['total_uris']} parsed={stats['parsed']} "
+                f"selected={len(nodes)} skipped_insecure={stats['skipped_insecure']} "
+                f"skipped_ssrf={stats['skipped_ssrf']} skipped_filtered={stats['skipped_filtered']} "
+                f"skipped_dup={stats['skipped_duplicate']}"
+            )
+            if stats["skipped_insecure"] > 0 and not allow_insecure:
+                log(
+                    "Notice: insecure/pinned-self-signed nodes were skipped (VPN_ALLOW_INSECURE=0). "
+                    "Set VPN_ALLOW_INSECURE=1 in .env if you explicitly trust them."
+                )
+
+            if nodes:
+                cfg = build_singbox_config(
+                    nodes,
+                    clash_secret=clash_secret,
+                    cache_path=os.path.join(STATE_DIR, "cache.db"),
+                    mtu=mtu,
+                    proxy_only=proxy_only,
+                )
+                ok, changed, err = atomic_apply_config(cfg)
+                if ok:
+                    log(f"Applied dynamic config ({len(nodes)} nodes, proxy_only={proxy_only}, changed={changed})")
+                    if changed and not cold_start:
+                        restart_singbox()
+                    return True
+                log(f"Validation failed for dynamic config: {err}")
+            else:
+                log("No usable proxy nodes remained after parsing/filtering")
+        except Exception as exc:
+            log(f"Subscription update failed ({redacted}): {exc}")
+        finally:
+            if bootstrap_opened:
+                run_bootstrap_cmd("bootstrap-revoke")
+
+    # Step 2: Cold-start fallback to config.last-good.json
+    if not os.path.isfile(active_path) and os.path.isfile(last_good_path):
+        try:
+            with open(last_good_path, "r", encoding="utf-8") as f:
+                lg_cfg = json.load(f)
+            ok, _, err = atomic_apply_config(lg_cfg, save_last_good=False)
+            if ok:
+                log("Cold-start fallback: restored config.last-good.json")
+                return True
+            log(f"config.last-good.json failed validation: {err}")
+        except Exception as exc:
+            log(f"Could not load config.last-good.json: {exc}")
+
+    # Step 3: Fallback to static /etc/sing-box/config.json
+    if not os.path.isfile(active_path) and os.path.isfile(static_path):
+        try:
+            with open(static_path, "r", encoding="utf-8") as f:
+                static_cfg = json.load(f)
+            hardened = harden_static_config(
+                static_cfg,
+                clash_secret=clash_secret,
+                cache_path=os.path.join(STATE_DIR, "cache.db"),
+            )
+            ok, _, err = atomic_apply_config(hardened, save_last_good=True)
+            if ok:
+                log("Fallback: applied hardened static /etc/sing-box/config.json")
+                return True
+            log(f"Static /etc/sing-box/config.json failed validation: {err}")
+        except Exception as exc:
+            log(f"Could not load static /etc/sing-box/config.json: {exc}")
+
+    return False
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="developer-infra sing-box subscription updater")
+    parser.add_argument("--once", action="store_true", help="Run a single update cycle and exit")
+    parser.add_argument("--daemon", action="store_true", help="Run continuously on schedule")
+    args = parser.parse_args()
+
+    if args.once or not args.daemon:
+        ok = perform_update(cold_start=not os.path.isfile(os.path.join(STATE_DIR, "config.active.json")))
+        return 0 if ok else 1
+
+    running = True
+
+    def _stop(_signum: int, _frame: Any) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    update_interval = int(os.environ.get("VPN_UPDATE_INTERVAL", "3600"))
+    retry_interval = int(os.environ.get("VPN_RETRY_INTERVAL", "600"))
+
+    first = True
+    while running:
+        ok = perform_update(cold_start=first)
+        first = False
+        sleep_secs = update_interval if ok else retry_interval
+        log(f"Next update check in {sleep_secs}s")
+        for _ in range(max(1, sleep_secs)):
+            if not running:
+                break
+            time.sleep(1)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

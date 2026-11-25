@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Synopsis: Launches Claude Code with model selection via OmniRoute proxy.
+# Launches Claude Code inside the container via supervised OmniRoute proxy (D3).
+# Stores model registry persistently in ~/.config/omniroute/claude_models.json.
 # Usage:
-#   ./start_claude.sh
-#   ./start_claude.sh -c "claude" -m 1
-#   ./start_claude.sh --add-model
-#   ./start_claude.sh --remove-model
+#   start-claude
+#   start-claude -c "claude" -m 1
+#   start-claude --add-model
+#   start-claude --remove-model
 # ==============================================================================
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_FILE="${SCRIPT_DIR}/claude_models.json"
-OMNIROUTE_PORT=20128
-OMNIROUTE_URL="http://localhost:${OMNIROUTE_PORT}"
+MODELS_DIR="${HOME}/.config/omniroute"
+MODELS_FILE="${MODELS_DIR}/claude_models.json"
+OMNIROUTE_PORT="${OMNIROUTE_PORT:-20128}"
+OMNIROUTE_URL="http://127.0.0.1:${OMNIROUTE_PORT}"
 OMNIROUTE_LOG="/tmp/omniroute_${OMNIROUTE_PORT}.log"
+VPN_STATE_FILE="/run/vpn/state"
 
-# ANSI Colors
 C_RESET='\033[0m'
 C_CYAN='\033[0;36m'
 C_YELLOW='\033[1;33m'
@@ -36,17 +37,36 @@ usage() {
 Usage: $(basename "$0") [OPTIONS]
 
 Options:
-  -c, --command <str>   Claude command to run (e.g., "claude" or "claude make team work")
+  -c, --command <str>   Claude command to run (e.g., "claude" or "claude --resume <id>")
   -m, --model <int>     Model ID number (1-N)
-  --add-model           Add a new model to claude_models.json
-  --remove-model        Remove an existing model from claude_models.json
+  --add-model           Add a new model to ${MODELS_FILE}
+  --remove-model        Remove an existing model from ${MODELS_FILE}
   -h, --help            Show this help message
 EOF
 }
 
-# ============================================
-# Dependency Verification
-# ============================================
+check_vpn_state() {
+    if [[ -r "$VPN_STATE_FILE" ]]; then
+        local st
+        st="$(tr -d '[:space:]' < "$VPN_STATE_FILE" 2>/dev/null || echo UNKNOWN)"
+        case "$st" in
+            UP)
+                print_color "$C_GREEN" "VPN status: UP (sing-tun active)"
+                ;;
+            DOWN_STRICT|KILLSWITCH_ERROR)
+                print_color "$C_RED" "WARNING: VPN kill-switch is active (state=${st}). Outbound AI API calls are blocked."
+                print_color "$C_YELLOW" "Check from host: ./vpn-ctl.ps1 status  (or ./vpn-ctl.sh status)"
+                ;;
+            DOWN_FALLBACK|DIRECT)
+                print_color "$C_YELLOW" "WARNING: VPN is NOT protecting traffic (state=${st}). Direct egress active."
+                ;;
+            *)
+                print_color "$C_YELLOW" "Notice: VPN state is '${st}'."
+                ;;
+        esac
+    fi
+}
+
 check_dependencies() {
     local missing=()
     for cmd in node omniroute claude curl; do
@@ -57,15 +77,12 @@ check_dependencies() {
 
     if [[ ${#missing[@]} -gt 0 ]]; then
         print_color "$C_RED" "ERROR: Missing required dependencies: ${missing[*]}"
-        print_color "$C_YELLOW" "Ensure Node.js, OmniRoute (npm i -g omniroute), Claude CLI, and curl are installed."
         exit 1
     fi
 }
 
-# ============================================
-# JSON Model Management (via Node.js)
-# ============================================
 ensure_models_file() {
+    mkdir -p "$MODELS_DIR"
     MODELS_FILE_ENV="$MODELS_FILE" node -e '
 const fs = require("fs");
 const file = process.env.MODELS_FILE_ENV;
@@ -156,9 +173,7 @@ console.log(nextId);
 ')
 
     print_color "$C_GREEN" "Models saved to: ${MODELS_FILE}"
-    print_color "$C_GREEN" $'\nModel added successfully!'
-    print_color "$C_WHITE" "  ID: ${next_id}"
-    print_color "$C_WHITE" "  Model: ${new_model}"
+    print_color "$C_GREEN" "Model added (ID: ${next_id}, Model: ${new_model})"
 }
 
 remove_model() {
@@ -212,19 +227,13 @@ keys.forEach((k, idx) => { renumbered[String(idx + 1)] = data[k]; });
 fs.writeFileSync(file, JSON.stringify(renumbered, null, 2) + "\n", "utf8");
 '
 
-    print_color "$C_GREEN" "Models saved to: ${MODELS_FILE}"
-    print_color "$C_GREEN" $'\nModel removed successfully!'
-    print_color "$C_WHITE" "  Removed: ${target_model}"
-    print_color "$C_WHITE" "  Models renumbered to maintain order: 1, 2, 3, ..."
+    print_color "$C_GREEN" "Removed '${target_model}' and updated ${MODELS_FILE}."
 }
 
 test_omniroute_health() {
     curl -s -f --max-time 3 "$OMNIROUTE_URL" >/dev/null 2>&1
 }
 
-# ============================================
-# Argument Parsing
-# ============================================
 COMMAND=""
 MODEL=0
 ACTION="run"
@@ -263,7 +272,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Pre-flight check for node (required for JSON operations)
 if ! command -v node >/dev/null 2>&1; then
     print_color "$C_RED" "ERROR: Node.js is required but not installed."
     exit 1
@@ -277,9 +285,8 @@ elif [[ "$ACTION" == "remove" ]]; then
     exit 0
 fi
 
-# Show interactive mode selector only when no CLI parameters were supplied
 if [[ -z "$COMMAND" && "$MODEL" -eq 0 ]]; then
-    print_color "$C_CYAN" $'Claude Code via OmniRoute Launcher\n'
+    print_color "$C_CYAN" $'Claude Code via Isolated OmniRoute Launcher\n'
     print_color "$C_YELLOW" $'Select mode:\n  1. Run Claude (select model and launch)\n  2. Add new model to list\n  3. Remove model from list\n'
     read -r -p "Enter your choice (1, 2, or 3) [default: 1]: " mode_choice
     mode_choice="${mode_choice:-1}"
@@ -296,25 +303,20 @@ if [[ -z "$COMMAND" && "$MODEL" -eq 0 ]]; then
 fi
 
 check_dependencies
+check_vpn_state
 
-# ============================================
-# Phase 1: Get Claude Command
-# ============================================
 if [[ -z "$COMMAND" ]]; then
     read -r -p "Enter Claude command [default: 'claude']: " input_cmd
     COMMAND="${input_cmd:-claude}"
 fi
 
-# ============================================
-# Phase 2: Get Auth Token
-# ============================================
 print_color "$C_CYAN" $'\nChecking authentication token...'
 AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-}"
 
 if [[ -z "$AUTH_TOKEN" ]]; then
-    print_color "$C_YELLOW" "ANTHROPIC_AUTH_TOKEN environment variable not set."
-    print_color "$C_GRAY"   "Tip: Export it via: export ANTHROPIC_AUTH_TOKEN='your-key'"
-    print_color "$C_YELLOW" "Please enter your OmniRoute API Key (input will be hidden):"
+    print_color "$C_YELLOW" "ANTHROPIC_AUTH_TOKEN is not set."
+    print_color "$C_GRAY"   "Tip: set ANTHROPIC_AUTH_TOKEN in .env or export it before launch."
+    print_color "$C_YELLOW" "Please enter your OmniRoute API Key (input hidden):"
     read -r -s auth_input
     echo ""
     AUTH_TOKEN="$auth_input"
@@ -325,9 +327,6 @@ if [[ -z "$AUTH_TOKEN" ]]; then
     fi
 fi
 
-# ============================================
-# Phase 3: Select Model
-# ============================================
 MAX_ID="$(get_model_count)"
 SELECTED_MODEL=""
 
@@ -341,7 +340,7 @@ if [[ -z "$SELECTED_MODEL" ]]; then
     read -r -p "Enter model number (1-${MAX_ID}): " model_input
 
     if [[ ! "$model_input" =~ ^[0-9]+$ ]] || [[ "$model_input" -lt 1 ]] || [[ "$model_input" -gt "$MAX_ID" ]]; then
-        print_color "$C_RED" "ERROR: Invalid model choice. Please enter a number from 1 to ${MAX_ID}."
+        print_color "$C_RED" "ERROR: Invalid model choice. Enter 1-${MAX_ID}."
         exit 1
     fi
     MODEL="$model_input"
@@ -350,68 +349,54 @@ fi
 
 print_color "$C_GREEN" "Selected model: ${SELECTED_MODEL}"
 
-# ============================================
-# Phase 4: Check and Start OmniRoute
-# ============================================
-print_color "$C_CYAN" $'\nChecking OmniRoute status...'
+# Wait briefly for supervised OmniRoute service; only spawn locally if not supervised
+print_color "$C_CYAN" $'\nChecking supervised OmniRoute health...'
+IS_HEALTHY=false
+for attempt in $(seq 1 10); do
+    if test_omniroute_health; then
+        IS_HEALTHY=true
+        break
+    fi
+    sleep 1
+done
 
-if test_omniroute_health; then
-    print_color "$C_GREEN" "OmniRoute is already running and healthy."
+if [[ "$IS_HEALTHY" == "true" ]]; then
+    print_color "$C_GREEN" "OmniRoute is healthy at ${OMNIROUTE_URL}."
 else
-    print_color "$C_YELLOW" "OmniRoute is not running. Starting it in background..."
-
+    print_color "$C_YELLOW" "Supervised OmniRoute did not respond yet; starting fallback instance..."
     nohup omniroute --port="$OMNIROUTE_PORT" >"$OMNIROUTE_LOG" 2>&1 &
-    OMNIROUTE_PID=$!
-
-    print_color "$C_GREEN" "OmniRoute started in background (PID: ${OMNIROUTE_PID}, Log: ${OMNIROUTE_LOG})"
-    print_color "$C_CYAN"  "Waiting for OmniRoute to become healthy..."
-
-    MAX_ATTEMPTS=30
-    IS_HEALTHY=false
-
-    for (( attempt=1; attempt<=MAX_ATTEMPTS; attempt++ )); do
+    for attempt in $(seq 1 20); do
         sleep 1
         if test_omniroute_health; then
-            print_color "$C_GREEN" "OmniRoute is now healthy (attempt ${attempt}/${MAX_ATTEMPTS})"
             IS_HEALTHY=true
             break
         fi
-        echo "Waiting... (attempt ${attempt}/${MAX_ATTEMPTS})"
     done
-
     if [[ "$IS_HEALTHY" != "true" ]]; then
-        print_color "$C_RED"    "ERROR: OmniRoute failed to start after ${MAX_ATTEMPTS} seconds."
-        print_color "$C_YELLOW" "Check log file for details: ${OMNIROUTE_LOG}"
+        print_color "$C_RED" "ERROR: OmniRoute failed to respond on ${OMNIROUTE_URL}."
+        print_color "$C_YELLOW" "Inspect logs: docker compose exec -u root ubuntu-dev tail -n 50 /var/log/supervisor/omniroute.err.log"
         exit 1
     fi
 fi
 
-# ============================================
-# Phase 5: Set Environment Variables
-# ============================================
-print_color "$C_CYAN" $'\nSetting up environment...'
-
 export ANTHROPIC_AUTH_TOKEN="$AUTH_TOKEN"
 export ANTHROPIC_BASE_URL="${OMNIROUTE_URL}/v1"
 export ANTHROPIC_MODEL="$SELECTED_MODEL"
-export ANTHROPIC_deepseek_MODEL="deepseek-v4-flash"
-export ENABLE_CC_COMPATIBLE_PROVIDER="true"
-export CLAUDE_CODE_SKIP_UPDATE_CHECK="1"
-export CLAUDE_CODE_DISABLE_ARTIFACT="1"
-
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$SELECTED_MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$SELECTED_MODEL"
 export ANTHROPIC_DEFAULT_OPUS_MODEL="$SELECTED_MODEL"
-export CLAUDE_CODE_SUBAGENT_MODEL=glm-5.2
-export CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1
+export ANTHROPIC_deepseek_MODEL="deepseek-v4-flash"
+export CLAUDE_CODE_SUBAGENT_MODEL="glm-5.2"
+export ENABLE_CC_COMPATIBLE_PROVIDER="true"
+export CLAUDE_CODE_SKIP_UPDATE_CHECK="1"
+export CLAUDE_CODE_DISABLE_ARTIFACT="1"
+export CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK="1"
 
 print_color "$C_GREEN" "Environment configured:"
 echo "  ANTHROPIC_MODEL    = ${ANTHROPIC_MODEL}"
 echo "  ANTHROPIC_BASE_URL = ${ANTHROPIC_BASE_URL}"
+echo "  MODELS_FILE        = ${MODELS_FILE}"
 
-# ============================================
-# Phase 6: Launch Claude
-# ============================================
 print_color "$C_CYAN"  $'\nStarting Claude Code via OmniRoute...'
 print_color "$C_WHITE" "Command: ${COMMAND}"
 print_color "$C_GRAY"  $'\n========================================\n'
@@ -421,17 +406,11 @@ eval "$COMMAND"
 CMD_EXIT_CODE=$?
 set -e
 
-# ============================================
-# Phase 7: Cleanup Instructions
-# ============================================
 print_color "$C_GRAY" $'\n========================================'
-
 if [[ $CMD_EXIT_CODE -ne 0 ]]; then
-    print_color "$C_RED" "ERROR: Failed to execute command (exit code ${CMD_EXIT_CODE})."
+    print_color "$C_RED" "Claude exited with code ${CMD_EXIT_CODE}."
     exit "$CMD_EXIT_CODE"
 fi
 
-print_color "$C_CYAN"   "Session ended."
-print_color "$C_YELLOW" "OmniRoute is still running in the background (Port ${OMNIROUTE_PORT})."
-print_color "$C_YELLOW" "To stop it manually, run: pkill -f 'omniroute --port=${OMNIROUTE_PORT}'"
+print_color "$C_CYAN" "Session ended. OmniRoute remains supervised inside the container."
 exit 0

@@ -1,11 +1,17 @@
-ping google.com -c 4
-ping 8.8.8.8 -c 4
-ping github.com -c 4
+#!/usr/bin/env bash
+# Quick egress & VPN diagnostic script (does not write temporary files into /etc/sing-box).
+set -euo pipefail
 
-wget ipinfo.io/what-is-my-ip
-cat what-is-my-ip
+echo "=== VPN Status ==="
+if command -v vpn-ctl >/dev/null 2>&1; then
+    vpn-ctl status || true
+fi
 
-# GUI smoke test: xeyes shows up instantly on the Windows desktop via WSLg
-export DISPLAY="${DISPLAY:-:0}"
-xeyes >/dev/null 2>&1 &
-chromium --no-sandbox "google.com/search?hl=ru-en&q=Jesus+Christ" "https://youtube.com" "ipleak.net" "dnsleaktest.com" "browserleaks.com/webrtc" &
+echo ""
+echo "=== TUN Interface ==="
+ip a show sing-tun || echo "sing-tun is DOWN"
+
+echo ""
+echo "=== Egress IP (ipinfo.io) ==="
+curl -fsS --max-time 8 https://ipinfo.io || echo "Egress check failed (kill-switch active or no route)"
+echo ""
