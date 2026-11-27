@@ -111,9 +111,21 @@ class TestComposeAndCli(unittest.TestCase):
         self.assertIn("vpn-status-server.py", df)
 
     def test_powershell_scripts_structure_and_isolation(self):
-        for ps_name in ["start-claude.ps1", "run-env.ps1", "vpn-ctl.ps1"]:
-            text = (ROOT / ps_name).read_text(encoding="utf-8")
+        for ps_name in ["start-claude.ps1", "run-env.ps1", "vpn-ctl.ps1", "collect-logs.ps1", "diag-env.ps1"]:
+            raw = (ROOT / ps_name).read_bytes()
+            raw.decode("ascii")  # pure 7-bit ASCII avoids Windows PowerShell 5.1 UTF-8-without-BOM issues
+            text = raw.decode("utf-8")
             check_balanced_delimiters(text, ps_name)
+            self.assertNotRegex(
+                text,
+                r"\[[A-Za-z0-9_.]+\]\(\s*if\b",
+                f"Invalid PowerShell cast around if-statement in {ps_name} (use separate if or $(if ...))",
+            )
+            self.assertNotIn(
+                ".ArgumentList",
+                text,
+                f"ProcessStartInfo.ArgumentList is unavailable on Windows PowerShell 5.1 (.NET 4.x) in {ps_name}",
+            )
             self.assertNotIn("ubuntu24-dev-box", text, f"Legacy container name in {ps_name}")
             self.assertIn("ubuntu-dev", text, f"Missing ubuntu-dev service in {ps_name}")
 
@@ -139,6 +151,23 @@ class TestComposeAndCli(unittest.TestCase):
         vc_ps1 = (ROOT / "vpn-ctl.ps1").read_text(encoding="utf-8")
         self.assertIn('"proxy"', vc_ps1)
         self.assertIn('"retest"', vc_ps1)
+
+        # v2.2/v2.2.1 diagnostic & log collection scripts
+        for diag_name in ["collect-logs.ps1", "collect-logs.sh", "diag-env.ps1", "diag-env.sh"]:
+            self.assertTrue((ROOT / diag_name).is_file(), f"Missing diagnostic script: {diag_name}")
+        self.assertIn("[LOG APPENDED]", (ROOT / "collect-logs.ps1").read_text(encoding="utf-8"))
+        self.assertIn("[LOG APPENDED]", (ROOT / "collect-logs.sh").read_text(encoding="utf-8"))
+        diag_ps1 = (ROOT / "diag-env.ps1").read_text(encoding="utf-8")
+        self.assertIn("collect-logs.ps1", diag_ps1)
+        self.assertIn("$collectParams = @{", diag_ps1, "diag-env.ps1 must use hashtable splatting for collect-logs.ps1")
+        self.assertIn("[1/4.1]", diag_ps1)
+        self.assertIn("[2/4.4]", diag_ps1)
+        self.assertIn("[3/4.4]", diag_ps1)
+        diag_sh = (ROOT / "diag-env.sh").read_text(encoding="utf-8")
+        self.assertIn("collect-logs.sh", diag_sh)
+        self.assertIn("[1/4.1]", diag_sh)
+        self.assertIn("[2/4.4]", diag_sh)
+        self.assertIn("[3/4.4]", diag_sh)
 
     def test_start_claude_sh_uses_writable_models_path(self):
         sc_sh = (ROOT / "start-claude.sh").read_text(encoding="utf-8")

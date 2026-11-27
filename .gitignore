@@ -16,6 +16,7 @@ sing-box/sing-box-*/
 
 # User workspace & local data
 workspace/
+diagnostics/
 *.log
 *.pid
 

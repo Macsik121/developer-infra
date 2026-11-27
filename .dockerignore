@@ -17,6 +17,7 @@ sing-box/sing-box-*/
 
 # Local workspace & tests
 workspace/
+diagnostics/
 tests/
 scripts/
 *.log

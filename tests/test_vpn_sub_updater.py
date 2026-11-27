@@ -1,5 +1,6 @@
 import base64
 import importlib.util
+import json
 import os
 import stat
 import tempfile
@@ -231,6 +232,79 @@ class TestVpnSubUpdater(unittest.TestCase):
             self.assertFalse(changed2)
             self.assertIn("invalid schema", err2)
             self.assertEqual(Path(active).read_text(), before)
+
+    def test_dead_tunnel_recovery_retries_with_bootstrap_and_fwmark(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run_vpn"
+            state_dir = Path(td) / "state"
+            run_dir.mkdir()
+            state_dir.mkdir()
+            (run_dir / "subscription_url").write_text("https://sub.example.net/sub/secret", encoding="utf-8")
+            (run_dir / "clash_secret").write_text("sec-abc", encoding="utf-8")
+            (run_dir / "mode").write_text("strict", encoding="utf-8")
+            # Simulate stale existing config.active.json from an older release
+            (state_dir / "config.active.json").write_text('{"stale": true}\n', encoding="utf-8")
+
+            fetch_calls = []
+            bootstrap_calls = []
+            restarted = []
+
+            def fake_fetch(url, use_fwmark=False, **_kwargs):
+                fetch_calls.append(use_fwmark)
+                if not use_fwmark:
+                    raise OSError("tunnel timeout")
+                return self.F8_URIS[0].encode("utf-8")
+
+            with mock.patch.object(updater, "RUN_VPN_DIR", str(run_dir)), \
+                 mock.patch.object(updater, "STATE_DIR", str(state_dir)), \
+                 mock.patch.object(updater, "fetch_subscription_bytes", side_effect=fake_fetch), \
+                 mock.patch.object(updater, "run_bootstrap_cmd", side_effect=lambda a, arg=None: bootstrap_calls.append((a, arg))), \
+                 mock.patch.object(updater, "validate_config_with_singbox", return_value=(True, "")), \
+                 mock.patch.object(updater, "restart_singbox", side_effect=lambda: restarted.append(True)), \
+                 mock.patch.dict(os.environ, {"VPN_PROBE_NODES": "0"}):
+                ok = updater.perform_update(cold_start=True)
+
+            self.assertTrue(ok)
+            self.assertEqual(fetch_calls, [False, True])
+            self.assertEqual(
+                bootstrap_calls,
+                [("bootstrap-allow", "sub.example.net"), ("bootstrap-revoke", None)],
+            )
+            self.assertEqual(restarted, [True])
+
+    def test_offline_fallback_resyncs_clash_secret_in_persisted_config(self):
+        from unittest import mock
+
+        nodes, _ = updater.parse_subscription_uris(self.F8_URIS, allow_insecure=False)
+        stale_cfg = updater.build_singbox_config(nodes[:1], clash_secret="old-boot-secret")
+
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run_vpn"
+            state_dir = Path(td) / "state"
+            run_dir.mkdir()
+            state_dir.mkdir()
+            (run_dir / "subscription_url").write_text("https://sub.example.net/sub/secret", encoding="utf-8")
+            (run_dir / "clash_secret").write_text("new-boot-secret-999", encoding="utf-8")
+            (run_dir / "mode").write_text("strict", encoding="utf-8")
+            active_path = state_dir / "config.active.json"
+            active_path.write_text(json.dumps(stale_cfg), encoding="utf-8")
+
+            restarted = []
+
+            with mock.patch.object(updater, "RUN_VPN_DIR", str(run_dir)), \
+                 mock.patch.object(updater, "STATE_DIR", str(state_dir)), \
+                 mock.patch.object(updater, "fetch_subscription_bytes", side_effect=OSError("offline")), \
+                 mock.patch.object(updater, "run_bootstrap_cmd"), \
+                 mock.patch.object(updater, "validate_config_with_singbox", return_value=(True, "")), \
+                 mock.patch.object(updater, "restart_singbox", side_effect=lambda: restarted.append(True)):
+                ok = updater.perform_update(cold_start=True)
+
+            self.assertFalse(ok)
+            updated = json.loads(active_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated["experimental"]["clash_api"]["secret"], "new-boot-secret-999")
+            self.assertEqual(restarted, [True])
 
 
 if __name__ == "__main__":

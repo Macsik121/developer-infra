@@ -24,12 +24,14 @@ import argparse
 import base64
 import concurrent.futures
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import re
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -724,8 +726,67 @@ def harden_static_config(
     return cfg
 
 
-def fetch_subscription_bytes(url: str, max_bytes: int = MAX_SUB_BYTES, timeout: int = FETCH_TIMEOUT) -> bytes:
-    """Download subscription payload with strict size cap and timeout."""
+def _create_marked_connection(
+    address: Tuple[str, int],
+    timeout: float = FETCH_TIMEOUT,
+    source_address: Optional[Tuple[str, int]] = None,
+    fwmark: int = DEFAULT_FWMARK,
+) -> socket.socket:
+    host, port = address
+    last_err: Optional[OSError] = None
+    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
+        af, socktype, proto, _, sa = res
+        sock = socket.socket(af, socktype, proto)
+        try:
+            sock.settimeout(timeout)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, SO_MARK, fwmark)
+            except OSError:
+                pass
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as exc:
+            last_err = exc
+            try:
+                sock.close()
+            except OSError:
+                pass
+    if last_err is not None:
+        raise last_err
+    raise OSError(f"Could not connect to {host}:{port}")
+
+
+class _MarkedHTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        self.sock = _create_marked_connection((self.host, self.port), self.timeout or FETCH_TIMEOUT, self.source_address)
+
+
+class _MarkedHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        raw_sock = _create_marked_connection((self.host, self.port), self.timeout or FETCH_TIMEOUT, self.source_address)
+        ctx = self._context if hasattr(self, "_context") else ssl.create_default_context()
+        self.sock = ctx.wrap_socket(raw_sock, server_hostname=self.host)
+
+
+class _MarkedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(_MarkedHTTPConnection, req)
+
+
+class _MarkedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req: urllib.request.Request) -> Any:
+        return self.do_open(_MarkedHTTPSConnection, req, context=ssl.create_default_context())
+
+
+def fetch_subscription_bytes(
+    url: str,
+    max_bytes: int = MAX_SUB_BYTES,
+    timeout: int = FETCH_TIMEOUT,
+    use_fwmark: bool = False,
+) -> bytes:
+    """Download subscription payload with strict size cap, timeout, and optional SO_MARK=255 bypass."""
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme not in {"http", "https"}:
         raise ValueError(f"Unsupported subscription scheme: {parsed.scheme}")
@@ -739,9 +800,14 @@ def fetch_subscription_bytes(url: str, max_bytes: int = MAX_SUB_BYTES, timeout: 
             "Accept": "text/plain, */*",
         },
     )
+    opener = (
+        urllib.request.build_opener(_MarkedHTTPHandler(), _MarkedHTTPSHandler())
+        if use_fwmark
+        else urllib.request.build_opener()
+    )
     chunks: List[bytes] = []
     total = 0
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         while True:
             chunk = resp.read(65536)
             if not chunk:
@@ -797,14 +863,18 @@ def file_sha256(path: str) -> str:
 
 def atomic_apply_config(
     cfg: Dict[str, Any],
-    state_dir: str = STATE_DIR,
-    sing_box_bin: str = SING_BOX_BIN,
+    state_dir: Optional[str] = None,
+    sing_box_bin: Optional[str] = None,
     save_last_good: bool = True,
 ) -> Tuple[bool, bool, str]:
     """
     Validate and atomically replace config.active.json.
     Returns: (success, changed, error_message)
     """
+    if state_dir is None:
+        state_dir = STATE_DIR
+    if sing_box_bin is None:
+        sing_box_bin = SING_BOX_BIN
     new_path = os.path.join(state_dir, "config.new.json")
     active_path = os.path.join(state_dir, "config.active.json")
     last_good_path = os.path.join(state_dir, "config.last-good.json")
@@ -888,15 +958,31 @@ def perform_update(cold_start: bool = False) -> bool:
     if sub_url:
         redacted = redact_url(sub_url)
         sub_host = urllib.parse.urlsplit(sub_url).hostname or ""
+        had_existing_active = os.path.isfile(active_path)
         bootstrap_opened = False
         try:
-            if cold_start and sub_host and not os.path.isfile(active_path):
+            if cold_start and sub_host and not had_existing_active:
                 log(f"Cold-start bootstrap: temporarily allowing HTTPS to {sub_host}")
                 run_bootstrap_cmd("bootstrap-allow", sub_host)
                 bootstrap_opened = True
 
             log(f"Fetching subscription from {redacted}")
-            raw_bytes = fetch_subscription_bytes(sub_url)
+            try:
+                raw_bytes = fetch_subscription_bytes(sub_url, use_fwmark=bootstrap_opened)
+            except Exception as tunnel_exc:
+                # Dead-tunnel recovery: if existing config.active.json has stale/dead nodes,
+                # retry once directly over eth0 using scoped bootstrap-allow + SO_MARK=255.
+                if sub_host and not bootstrap_opened:
+                    log(
+                        f"Tunnel fetch failed ({tunnel_exc}); retrying once via scoped "
+                        f"bootstrap-allow + fwmark 0xff for {sub_host}"
+                    )
+                    run_bootstrap_cmd("bootstrap-allow", sub_host)
+                    bootstrap_opened = True
+                    raw_bytes = fetch_subscription_bytes(sub_url, use_fwmark=True)
+                else:
+                    raise
+
             uris = decode_subscription_payload(raw_bytes)
 
             # Parse a wide pool first so TCP pre-probe can filter out unreachable RU/bridge nodes
@@ -946,7 +1032,7 @@ def perform_update(cold_start: bool = False) -> bool:
                 ok, changed, err = atomic_apply_config(cfg)
                 if ok:
                     log(f"Applied dynamic config ({len(nodes)} nodes, proxy_only={proxy_only}, changed={changed})")
-                    if changed and not cold_start:
+                    if changed and (not cold_start or had_existing_active):
                         restart_singbox()
                     return True
                 log(f"Validation failed for dynamic config: {err}")
@@ -958,14 +1044,20 @@ def perform_update(cold_start: bool = False) -> bool:
             if bootstrap_opened:
                 run_bootstrap_cmd("bootstrap-revoke")
 
-    # Step 2: Cold-start fallback to config.last-good.json
+    # Step 2: Cold-start fallback to config.last-good.json (resync clash_api.secret)
     if not os.path.isfile(active_path) and os.path.isfile(last_good_path):
         try:
             with open(last_good_path, "r", encoding="utf-8") as f:
                 lg_cfg = json.load(f)
+            if isinstance(lg_cfg, dict):
+                exp = lg_cfg.setdefault("experimental", {})
+                if isinstance(exp, dict):
+                    clash = exp.setdefault("clash_api", {})
+                    if isinstance(clash, dict):
+                        clash["secret"] = clash_secret
             ok, _, err = atomic_apply_config(lg_cfg, save_last_good=False)
             if ok:
-                log("Cold-start fallback: restored config.last-good.json")
+                log("Cold-start fallback: restored config.last-good.json (synced clash_secret)")
                 return True
             log(f"config.last-good.json failed validation: {err}")
         except Exception as exc:
@@ -988,6 +1080,27 @@ def perform_update(cold_start: bool = False) -> bool:
             log(f"Static /etc/sing-box/config.json failed validation: {err}")
         except Exception as exc:
             log(f"Could not load static /etc/sing-box/config.json: {exc}")
+
+    # Step 4: If keeping an existing config.active.json after a failed update,
+    # ensure its clash_api.secret matches the current boot's /run/vpn/clash_secret
+    # so vpn-ctl select / retest / vpn-status never hit HTTP 401.
+    if os.path.isfile(active_path):
+        try:
+            with open(active_path, "r", encoding="utf-8") as f:
+                cur_cfg = json.load(f)
+            if isinstance(cur_cfg, dict):
+                exp = cur_cfg.get("experimental")
+                clash = exp.get("clash_api") if isinstance(exp, dict) else None
+                if isinstance(clash, dict) and clash.get("secret") != clash_secret:
+                    clash["secret"] = clash_secret
+                    ok, changed, err = atomic_apply_config(cur_cfg, save_last_good=False)
+                    if ok and changed:
+                        log("Synced current clash_secret into persisted config.active.json")
+                        restart_singbox()
+                    elif not ok:
+                        log(f"Could not resync clash_secret in config.active.json: {err}")
+        except Exception as exc:
+            log(f"Could not inspect existing config.active.json for clash_secret sync: {exc}")
 
     return False
 

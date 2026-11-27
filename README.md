@@ -195,22 +195,39 @@ python3 -m unittest discover -s tests -v
 docker run --rm --entrypoint "" -v "${PWD}:/repo:ro" -w /repo devbox-main-ubuntu-dev:latest python3 -m unittest discover -s tests -v
 ```
 
-### Живой Smoke-Test после запуска контейнера
+### Живой Smoke-Test и полная системная диагностика
 ```bash
 ./scripts/smoke-test.sh
 # С активной проверкой блокировки IPv4 + Docker DNS (127.0.0.11) при остановке sing-box:
 ./scripts/smoke-test.sh --test-killswitch
 ```
 
+**Полный аудит системы + сбор логов (работает с хоста на Windows и Linux, сохраняет отчёт в `diagnostics/`):**
+```powershell
+# Windows (PowerShell):
+.\diag-env.ps1                     # полный аудит: supervisor, сеть (L3/DNS/L7 TUN + :2080), vpn-ctl, SO_MARK=255 и все логи
+.\diag-env.ps1 -LogScope ask       # полный аудит + интерактивный выбор группы логов
+.\collect-logs.ps1                 # отдельный интерактивный сборщик логов (all / vpn / gui / dev / один пакет)
+.\collect-logs.ps1 -Scope vpn -Lines 50
+```
+```bash
+# Linux / macOS / WSL:
+./diag-env.sh                      # полный аудит системы
+./collect-logs.sh                  # интерактивный сборщик логов
+./collect-logs.sh --scope vpn --lines 50
+```
+Все собранные диагностические файлы автоматически маскируют секреты/токены и не попадают в git (`diagnostics/` в `.gitignore`).
+
 ---
 
 ## 9. Troubleshooting
 
-- **Нет интернета при поднятом `sing-tun` (`DEGRADED_NO_EGRESS`):**
-  1. Выполните `.\vpn-ctl.ps1 status` — проверьте `Reachable` и `Recent Errors`.
-  2. Прогоните `.\vpn-ctl.ps1 retest` и `.\vpn-ctl.ps1 select` → выберите рабочую ноду по номеру (`.\vpn-ctl.ps1 select 2`).
-  3. Запустите `.\vpn-ctl.ps1 update` — TCP pre-probe автоматически отсеет недоступные ноды и выберет рабочие.
-  4. Если в логе `skipped_insecure > 0`, установите `VPN_ALLOW_INSECURE=1` в `.env` и перезапустите контейнер.
+- **Нет интернета при поднятом `sing-tun` (`DEGRADED_NO_EGRESS` или `ping` проходит, а `curl`/Chromium падают):**
+  1. Запустите `.\diag-env.ps1` (или `./diag-env.sh`) — скрипт проверит `supervisorctl`, маршрутизацию, реальный L7-выход через TUN и прокси `:2080`, прямой TCP `SO_MARK=255` до нод и сложит подписанные логи в `diagnostics/diag-<timestamp>/`.
+  2. Выполните `.\vpn-ctl.ps1 status` — проверьте `Reachable` и `Recent Errors`.
+  3. Прогоните `.\vpn-ctl.ps1 retest` и `.\vpn-ctl.ps1 select` → выберите рабочую ноду по номеру (`.\vpn-ctl.ps1 select 2`).
+  4. Запустите `.\vpn-ctl.ps1 update` — TCP pre-probe автоматически отсеет недоступные ноды и выберет рабочие (при «мёртвом» туннеле выполняется авто-восстановление через `bootstrap-allow` + `fwmark 0xff`).
+  5. Если в логе `skipped_insecure > 0`, установите `VPN_ALLOW_INSECURE=1` в `.env` и перезапустите контейнер.
 - **Конфликт портов / `WSAEACCES` на Windows (`bind: An attempt was made to access a socket in a way forbidden`):**
   - Запустите `.\run-env.ps1 -CheckPorts`, чтобы увидеть точную причину (процесс, другой контейнер `developer-infra` или `WinNAT excludedportrange`), и запускайте через `.\run-env.ps1 -AutoPort`.
 - **Ошибка `KILLSWITCH_ERROR` в статусе:** ядро хоста не поддерживает `xt_mark`. Обновите ядро WSL2 (`wsl --update`) или временно переключитесь на `direct`.

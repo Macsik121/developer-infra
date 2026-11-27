@@ -28,6 +28,10 @@ class TestDocsParity(unittest.TestCase):
             "run-env.sh",
             "vpn-ctl.ps1",
             "vpn-ctl.sh",
+            "collect-logs.ps1",
+            "collect-logs.sh",
+            "diag-env.ps1",
+            "diag-env.sh",
             "start-claude.ps1",
             "scripts/smoke-test.sh",
         ]

@@ -112,7 +112,7 @@ def probe_egress(force: bool = False) -> Dict[str, Any]:
             "https://ipinfo.io/json",
             headers={"User-Agent": "developer-infra-status/2.1", "Accept": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with urllib.request.urlopen(req, timeout=3) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
             result["ok"] = True
             result["ip"] = str(payload.get("ip", ""))
@@ -155,14 +155,17 @@ def last_updater_line() -> str:
         return ""
 
 
-def collect_status(force_egress: bool = False) -> Dict[str, Any]:
+def collect_status(force_egress: bool = False, skip_egress: bool = False) -> Dict[str, Any]:
     mode = read_text(os.path.join(RUN_VPN_DIR, "mode"), "strict")
     state = read_text(os.path.join(RUN_VPN_DIR, "state"), "UNKNOWN")
     tun_up = is_tun_up()
     sb_running = is_singbox_running()
     proxies = query_clash_proxies()
     sel_now, leaf_node, delay_ms, reachable_count, total_nodes = resolve_active_node(proxies)
-    egress = probe_egress(force=force_egress)
+    if skip_egress:
+        egress = _EGRESS_CACHE["data"] or {"ok": False, "ip": "", "country": "", "org": "", "error": "fast-mode (skipped)"}
+    else:
+        egress = probe_egress(force=force_egress)
 
     return {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
@@ -265,9 +268,20 @@ class StatusHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         q = urllib.parse.parse_qs(parsed.query)
         force = q.get("refresh", ["0"])[0] == "1"
+        fast = q.get("fast", ["0"])[0] == "1"
+
+        if parsed.path == "/healthz":
+            body = b'{"status":"ok"}\n'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
 
         if parsed.path == "/api/status":
-            data = collect_status(force_egress=force)
+            data = collect_status(force_egress=force, skip_egress=fast)
             body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -278,7 +292,7 @@ class StatusHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path in {"/", "/index.html", "/status"}:
-            data = collect_status(force_egress=force)
+            data = collect_status(force_egress=force, skip_egress=fast)
             body = render_html(data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
