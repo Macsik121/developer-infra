@@ -306,6 +306,64 @@ class TestVpnSubUpdater(unittest.TestCase):
             self.assertEqual(updated["experimental"]["clash_api"]["secret"], "new-boot-secret-999")
             self.assertEqual(restarted, [True])
 
+    def test_tun_address_defaults_to_non_docker_range_and_avoids_collisions(self):
+        import ipaddress
+
+        nodes, _ = updater.parse_subscription_uris(self.F8_URIS, allow_insecure=False)
+        cfg = updater.build_singbox_config(nodes[:1], clash_secret="sec")
+        tun = next(ib for ib in cfg["inbounds"] if ib["type"] == "tun")
+        self.assertEqual(tun["address"], ["198.18.0.1/30"])
+
+        docker_172_19 = [ipaddress.ip_network("172.19.0.0/16")]
+        self.assertEqual(updater.pick_safe_tun_address("172.19.0.1/30", existing_nets=docker_172_19), "198.18.0.1/30")
+
+        busy_198_18 = [ipaddress.ip_network("198.18.0.0/16")]
+        self.assertEqual(updater.pick_safe_tun_address("198.18.0.1/30", existing_nets=busy_198_18), "198.19.0.1/30")
+
+    def test_heal_colliding_active_config_migrates_172_19_before_fetch(self):
+        import ipaddress
+        from unittest import mock
+
+        nodes, _ = updater.parse_subscription_uris(self.F8_URIS, allow_insecure=False)
+        legacy_cfg = updater.build_singbox_config(nodes[:1], clash_secret="old-sec", tun_address="172.19.0.1/30")
+
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td)
+            active_path = state_dir / "config.active.json"
+            active_path.write_text(json.dumps(legacy_cfg), encoding="utf-8")
+            restarted = []
+
+            with mock.patch.object(updater, "STATE_DIR", str(state_dir)), \
+                 mock.patch.object(updater, "validate_config_with_singbox", return_value=(True, "")), \
+                 mock.patch.object(updater, "restart_singbox", side_effect=lambda: restarted.append(True)), \
+                 mock.patch.object(updater.time, "sleep"):
+                healed = updater.heal_colliding_active_config(
+                    str(active_path),
+                    clash_secret="fresh-sec",
+                    safe_tun_addr="198.18.0.1/30",
+                    existing_nets=[ipaddress.ip_network("172.19.0.0/16")],
+                )
+
+            self.assertTrue(healed)
+            self.assertEqual(restarted, [True])
+            new_cfg = json.loads(active_path.read_text(encoding="utf-8"))
+            tun = next(ib for ib in new_cfg["inbounds"] if ib["type"] == "tun")
+            self.assertEqual(tun["address"], ["198.18.0.1/30"])
+            self.assertEqual(new_cfg["experimental"]["clash_api"]["secret"], "fresh-sec")
+
+    def test_parse_dns_a_response_handles_compression_pointer(self):
+        import struct
+
+        txid = 0x4242
+        query = updater._encode_dns_query("auth.example.ru", txid)
+        # Build minimal DNS response: header (ANCOUNT=1) + question + compressed answer pointer (0xC00C) -> 203.0.113.42
+        header = struct.pack("!HHHHHH", txid, 0x8180, 1, 1, 0, 0)
+        question = query[12:]
+        answer = struct.pack("!HHHIH", 0xC00C, 1, 1, 60, 4) + bytes([203, 0, 113, 42])
+        ips = updater._parse_dns_a_response(header + question + answer, txid)
+        self.assertEqual(ips, ["203.0.113.42"])
+        self.assertEqual(updater._parse_dns_a_response(header + question + answer, 0x1111), [])
+
 
 if __name__ == "__main__":
     unittest.main()

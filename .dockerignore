@@ -43,3 +43,5 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.zip
+unpack-build.ps1
+download-build.html

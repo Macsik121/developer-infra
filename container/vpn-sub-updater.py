@@ -28,10 +28,12 @@ import http.client
 import ipaddress
 import json
 import os
+import random
 import re
 import signal
 import socket
 import ssl
+import struct
 import subprocess
 import sys
 import time
@@ -44,6 +46,14 @@ MAX_SUB_BYTES = 5 * 1024 * 1024  # 5 MB cap (ST-5)
 FETCH_TIMEOUT = 15  # seconds
 SO_MARK = 36  # Linux socket option for fwmark (0xff = 255)
 DEFAULT_FWMARK = 255
+# RFC 2544 / Clash standard TUN range — never allocated by Docker bridge networks (172.17-31.x.x).
+DEFAULT_TUN_ADDRESS = "198.18.0.1/30"
+FALLBACK_TUN_ADDRESSES = (
+    "198.18.0.1/30",
+    "198.19.0.1/30",
+    "100.64.254.1/30",
+    "100.65.254.1/30",
+)
 
 # RU/BY mobile/bridge nodes commonly drop TCP SYN when reached through another VPN/foreign IP.
 LOW_PRIORITY_TAG_RE = re.compile(
@@ -489,6 +499,152 @@ def parse_subscription_uris(
     return capped, stats
 
 
+def _encode_dns_query(hostname: str, txid: int) -> bytes:
+    header = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+    labels = b"".join(
+        bytes([len(part)]) + part.encode("ascii")
+        for part in hostname.strip(".").split(".")
+        if part
+    )
+    return header + labels + b"\x00" + struct.pack("!HH", 1, 1)  # QTYPE=A, QCLASS=IN
+
+
+def _skip_dns_name(packet: bytes, offset: int) -> int:
+    n = len(packet)
+    while offset < n:
+        length = packet[offset]
+        if length == 0:
+            return offset + 1
+        if (length & 0xC0) == 0xC0:
+            return offset + 2
+        offset += 1 + length
+    return n
+
+
+def _parse_dns_a_response(packet: bytes, expected_txid: int) -> List[str]:
+    if len(packet) < 12:
+        return []
+    txid, _flags, qdcount, ancount, _nscount, _arcount = struct.unpack("!HHHHHH", packet[:12])
+    if txid != expected_txid:
+        return []
+    offset = 12
+    for _ in range(qdcount):
+        offset = _skip_dns_name(packet, offset)
+        offset += 4  # QTYPE + QCLASS
+    ips: List[str] = []
+    for _ in range(ancount):
+        if offset >= len(packet):
+            break
+        offset = _skip_dns_name(packet, offset)
+        if offset + 10 > len(packet):
+            break
+        rtype, rclass, _ttl, rdlength = struct.unpack("!HHIH", packet[offset : offset + 10])
+        offset += 10
+        if offset + rdlength > len(packet):
+            break
+        if rtype == 1 and rclass == 1 and rdlength == 4:
+            ips.append(str(ipaddress.IPv4Address(packet[offset : offset + 4])))
+        offset += rdlength
+    return ips
+
+
+def _resolve_ipv4_marked(
+    host: str,
+    dns_servers: Tuple[str, ...] = ("1.1.1.1", "8.8.8.8"),
+    timeout: float = 2.0,
+    fwmark: int = DEFAULT_FWMARK,
+) -> List[str]:
+    """
+    Resolve an IPv4 address using UDP/53 with SO_MARK=255 so DNS bypasses a dead sing-tun
+    and Docker's 127.0.0.11 resolver during dead-tunnel recovery and TCP pre-probing.
+    """
+    cleaned = host.strip().strip("[]")
+    try:
+        ipaddress.IPv4Address(cleaned)
+        return [cleaned]
+    except ValueError:
+        pass
+
+    for server in dns_servers:
+        txid = random.randint(1, 65534)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(timeout)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, SO_MARK, fwmark)
+            except OSError:
+                pass
+            sock.sendto(_encode_dns_query(cleaned, txid), (server, 53))
+            resp, _ = sock.recvfrom(1500)
+            ips = _parse_dns_a_response(resp, txid)
+            if ips:
+                return ips
+        except OSError:
+            continue
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return []
+
+
+def get_host_ipv4_networks(exclude_ifaces: Tuple[str, ...] = ("lo", "sing-tun")) -> List[ipaddress.IPv4Network]:
+    """Return IPv4 networks currently assigned to container non-TUN interfaces (e.g. eth0)."""
+    nets: List[ipaddress.IPv4Network] = []
+    try:
+        res = subprocess.run(
+            ["ip", "-4", "-o", "addr", "show"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if res.returncode != 0:
+            return nets
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            iface = parts[1].split("@")[0]
+            if iface in exclude_ifaces:
+                continue
+            for idx, tok in enumerate(parts):
+                if tok == "inet" and idx + 1 < len(parts):
+                    try:
+                        nets.append(ipaddress.ip_network(parts[idx + 1], strict=False))
+                    except ValueError:
+                        pass
+                    break
+    except Exception:
+        pass
+    return nets
+
+
+def tun_cidr_overlaps(cidr: str, existing_nets: List[ipaddress.IPv4Network]) -> bool:
+    try:
+        tun_net = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return True
+    if not isinstance(tun_net, ipaddress.IPv4Network):
+        return False
+    return any(tun_net.overlaps(net) for net in existing_nets)
+
+
+def pick_safe_tun_address(
+    preferred: str = DEFAULT_TUN_ADDRESS,
+    existing_nets: Optional[List[ipaddress.IPv4Network]] = None,
+) -> str:
+    """Pick a /30 TUN interface CIDR guaranteed not to collide with Docker's eth0 bridge subnet."""
+    nets = get_host_ipv4_networks() if existing_nets is None else existing_nets
+    candidates = [preferred, *FALLBACK_TUN_ADDRESSES]
+    for cand in candidates:
+        if not cand:
+            continue
+        if not tun_cidr_overlaps(cand, nets):
+            return cand
+    return DEFAULT_TUN_ADDRESS
+
+
 def _probe_single_node(node: Dict[str, Any], timeout: float = 1.5, fwmark: int = DEFAULT_FWMARK) -> Tuple[bool, float]:
     """
     Verify upstream reachability using SO_MARK=255 so probes bypass sing-tun.
@@ -500,26 +656,31 @@ def _probe_single_node(node: Dict[str, Any], timeout: float = 1.5, fwmark: int =
     t0 = time.monotonic()
 
     if node["type"] == "hysteria2":
+        if _resolve_ipv4_marked(host, timeout=min(timeout, 1.5), fwmark=fwmark):
+            return True, (time.monotonic() - t0) * 1000.0
         try:
             socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
             return True, (time.monotonic() - t0) * 1000.0
         except OSError:
             return False, 9999.0
 
-    try:
-        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
-    except OSError:
-        return False, 9999.0
+    target_ips = _resolve_ipv4_marked(host, timeout=min(timeout, 1.5), fwmark=fwmark)
+    if not target_ips:
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+            target_ips = [info[4][0] for info in infos[:2]]
+        except OSError:
+            return False, 9999.0
 
-    for family, socktype, proto, _, sockaddr in infos[:2]:
-        sock = socket.socket(family, socktype, proto)
+    for ip_str in target_ips[:2]:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.settimeout(timeout)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, SO_MARK, fwmark)
             except OSError:
                 pass
-            sock.connect(sockaddr)
+            sock.connect((ip_str, port))
             return True, (time.monotonic() - t0) * 1000.0
         except OSError:
             continue
@@ -578,8 +739,9 @@ def build_singbox_config(
     cache_path: str = "/var/lib/sing-box/cache.db",
     mtu: int = 1280,
     proxy_only: bool = False,
+    tun_address: str = DEFAULT_TUN_ADDRESS,
 ) -> Dict[str, Any]:
-    """Build modern sing-box 1.12 configuration preserving all F7/D5/D6/v2.1 invariants."""
+    """Build modern sing-box 1.12 configuration preserving all F7/D5/D6/v2.2 invariants."""
     if not nodes:
         raise ValueError("Cannot build sing-box config with zero valid proxy nodes")
 
@@ -616,7 +778,7 @@ def build_singbox_config(
                 "type": "tun",
                 "tag": "tun-in",
                 "interface_name": "sing-tun",
-                "address": ["172.19.0.1/30"],
+                "address": [tun_address],
                 "mtu": safe_mtu,
                 "auto_route": True,
                 "strict_route": True,
@@ -697,13 +859,24 @@ def harden_static_config(
     raw_cfg: Dict[str, Any],
     clash_secret: str,
     cache_path: str = "/var/lib/sing-box/cache.db",
+    tun_address: str = DEFAULT_TUN_ADDRESS,
 ) -> Dict[str, Any]:
     """
     Sanitize fallback static /etc/sing-box/config.json:
     - Drops broken empty-tag outbounds (like F7's outbounds[2]).
+    - Rewrites colliding 172.16-31.x.x TUN addresses to a safe non-Docker CIDR.
     - Enforces route.default_mark=255, cache_file in /var/lib/sing-box, and Clash API secret.
     """
     cfg = json.loads(json.dumps(raw_cfg))
+
+    inbounds = cfg.get("inbounds", [])
+    if isinstance(inbounds, list):
+        for ib in inbounds:
+            if isinstance(ib, dict) and ib.get("type") == "tun":
+                addrs = ib.get("address") or ([ib["inet4_address"]] if ib.get("inet4_address") else [])
+                if any(str(a).startswith("172.") for a in addrs):
+                    ib["address"] = [tun_address]
+                    ib.pop("inet4_address", None)
 
     outbounds = cfg.get("outbounds", [])
     if isinstance(outbounds, list):
@@ -734,9 +907,16 @@ def _create_marked_connection(
 ) -> socket.socket:
     host, port = address
     last_err: Optional[OSError] = None
-    for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM):
-        af, socktype, proto, _, sa = res
-        sock = socket.socket(af, socktype, proto)
+    # Prefer direct SO_MARK=255 UDP DNS first so dead sing-tun / 127.0.0.11 never blocks recovery
+    ips = _resolve_ipv4_marked(host, timeout=min(float(timeout), 3.0), fwmark=fwmark)
+    if not ips:
+        ips = [
+            res[4][0]
+            for res in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        ]
+
+    for ip_str in ips:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             sock.settimeout(timeout)
             try:
@@ -745,7 +925,7 @@ def _create_marked_connection(
                 pass
             if source_address:
                 sock.bind(source_address)
-            sock.connect(sa)
+            sock.connect((ip_str, port))
             return sock
         except OSError as exc:
             last_err = exc
@@ -928,6 +1108,71 @@ def run_bootstrap_cmd(action: str, arg: Optional[str] = None) -> None:
         pass
 
 
+def heal_colliding_active_config(
+    active_path: str,
+    clash_secret: str,
+    safe_tun_addr: str,
+    existing_nets: Optional[List[ipaddress.IPv4Network]] = None,
+) -> bool:
+    """
+    If a persisted config.active.json assigns a TUN CIDR (e.g. legacy 172.19.0.1/30)
+    that collides with Docker's eth0 bridge subnet (e.g. 172.19.0.2/16), sing-tun hijacks
+    Docker's default gateway and breaks ALL eth0 egress including SO_MARK=255 recovery.
+    Patch it immediately and reload sing-box BEFORE attempting subscription fetch.
+    """
+    if not os.path.isfile(active_path):
+        return False
+    nets = get_host_ipv4_networks() if existing_nets is None else existing_nets
+    if not nets:
+        return False
+    try:
+        with open(active_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return False
+        inbounds = cfg.get("inbounds")
+        if not isinstance(inbounds, list):
+            return False
+
+        collided = False
+        for ib in inbounds:
+            if not isinstance(ib, dict) or ib.get("type") != "tun":
+                continue
+            addrs = ib.get("address")
+            if isinstance(addrs, str):
+                addrs = [addrs]
+            if not addrs and ib.get("inet4_address"):
+                addrs = [ib["inet4_address"]]
+            if isinstance(addrs, list) and any(tun_cidr_overlaps(str(a), nets) for a in addrs):
+                ib["address"] = [safe_tun_addr]
+                ib.pop("inet4_address", None)
+                collided = True
+
+        if not collided:
+            return False
+
+        exp = cfg.setdefault("experimental", {})
+        if isinstance(exp, dict):
+            clash = exp.setdefault("clash_api", {})
+            if isinstance(clash, dict):
+                clash["secret"] = clash_secret
+
+        ok, changed, err = atomic_apply_config(cfg, save_last_good=False)
+        if ok and changed:
+            log(
+                f"Auto-healed persisted config.active.json: migrated colliding TUN subnet -> {safe_tun_addr} "
+                f"(prevented Docker eth0 gateway hijack)"
+            )
+            restart_singbox()
+            time.sleep(1.5)
+            return True
+        if not ok:
+            log(f"Could not auto-heal colliding TUN subnet in config.active.json: {err}")
+    except Exception as exc:
+        log(f"Error checking persisted config.active.json for TUN subnet collision: {exc}")
+    return False
+
+
 def perform_update(cold_start: bool = False) -> bool:
     sub_url = read_text_file(os.path.join(RUN_VPN_DIR, "subscription_url"))
     clash_secret = read_text_file(os.path.join(RUN_VPN_DIR, "clash_secret")) or "dev-infra-secret"
@@ -942,6 +1187,8 @@ def perform_update(cold_start: bool = False) -> bool:
     probe_enabled = is_truthy(os.environ.get("VPN_PROBE_NODES", "1"))
     node_filter = os.environ.get("VPN_NODE_FILTER", "")
     node_exclude = os.environ.get("VPN_NODE_EXCLUDE", "")
+    preferred_tun = os.environ.get("VPN_TUN_ADDRESS", DEFAULT_TUN_ADDRESS).strip() or DEFAULT_TUN_ADDRESS
+    safe_tun_addr = pick_safe_tun_address(preferred=preferred_tun)
     protocol_order = [
         p.strip() for p in os.environ.get("VPN_PROTOCOL_ORDER", "vless,hysteria2").split(",")
     ]
@@ -953,6 +1200,9 @@ def perform_update(cold_start: bool = False) -> bool:
         mtu = int(os.environ.get("VPN_MTU", "1280"))
     except ValueError:
         mtu = 1280
+
+    # Step 0: Immediately heal any legacy persisted config whose TUN CIDR collides with eth0
+    heal_colliding_active_config(active_path, clash_secret=clash_secret, safe_tun_addr=safe_tun_addr)
 
     # Step 1: Attempt dynamic subscription fetch
     if sub_url:
@@ -1004,7 +1254,7 @@ def perform_update(cold_start: bool = False) -> bool:
                 )
                 log(
                     f"TCP pre-probe: probed={probed_n} reachable={reachable_n} "
-                    f"selected={len(nodes)} (mode={current_mode}, mtu={mtu})"
+                    f"selected={len(nodes)} (mode={current_mode}, mtu={mtu}, tun={safe_tun_addr})"
                 )
             else:
                 nodes = candidates[:max_nodes]
@@ -1028,6 +1278,7 @@ def perform_update(cold_start: bool = False) -> bool:
                     cache_path=os.path.join(STATE_DIR, "cache.db"),
                     mtu=mtu,
                     proxy_only=proxy_only,
+                    tun_address=safe_tun_addr,
                 )
                 ok, changed, err = atomic_apply_config(cfg)
                 if ok:
@@ -1044,7 +1295,7 @@ def perform_update(cold_start: bool = False) -> bool:
             if bootstrap_opened:
                 run_bootstrap_cmd("bootstrap-revoke")
 
-    # Step 2: Cold-start fallback to config.last-good.json (resync clash_api.secret)
+    # Step 2: Cold-start fallback to config.last-good.json (resync clash_api.secret & safe TUN CIDR)
     if not os.path.isfile(active_path) and os.path.isfile(last_good_path):
         try:
             with open(last_good_path, "r", encoding="utf-8") as f:
@@ -1055,9 +1306,13 @@ def perform_update(cold_start: bool = False) -> bool:
                     clash = exp.setdefault("clash_api", {})
                     if isinstance(clash, dict):
                         clash["secret"] = clash_secret
+                for ib in (lg_cfg.get("inbounds") or []):
+                    if isinstance(ib, dict) and ib.get("type") == "tun":
+                        ib["address"] = [safe_tun_addr]
+                        ib.pop("inet4_address", None)
             ok, _, err = atomic_apply_config(lg_cfg, save_last_good=False)
             if ok:
-                log("Cold-start fallback: restored config.last-good.json (synced clash_secret)")
+                log("Cold-start fallback: restored config.last-good.json (synced clash_secret & TUN CIDR)")
                 return True
             log(f"config.last-good.json failed validation: {err}")
         except Exception as exc:
@@ -1072,6 +1327,7 @@ def perform_update(cold_start: bool = False) -> bool:
                 static_cfg,
                 clash_secret=clash_secret,
                 cache_path=os.path.join(STATE_DIR, "cache.db"),
+                tun_address=safe_tun_addr,
             )
             ok, _, err = atomic_apply_config(hardened, save_last_good=True)
             if ok:

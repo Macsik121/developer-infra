@@ -163,6 +163,12 @@ append_section "$NET_FILE" "Routing, DNS & Firewall (DEVINFRA_KS)" "$NET_ROUTE_O
 
 if printf '%s' "$NET_ROUTE_OUT" | grep -q "sing-tun:"; then
     record_check "PASS" "TUN interface (sing-tun)" "UP"
+    ETH0_GW="$(printf '%s\n' "$NET_ROUTE_OUT" | sed -nE 's/^default via ([0-9.]+) dev eth0.*/\1/p' | head -n 1)"
+    TUN_IP="$(printf '%s\n' "$NET_ROUTE_OUT" | sed -nE 's/^sing-tun[[:space:]]+[^[:space:]]+[[:space:]]+([0-9.]+)\/.*/\1/p' | head -n 1)"
+    if [[ -n "$ETH0_GW" ]] && [[ "$ETH0_GW" == "$TUN_IP" ]]; then
+        record_check "FAIL" "TUN / eth0 subnet collision" "CRITICAL: sing-tun stole Docker gateway IP ${ETH0_GW}!"
+        HINTS+=("CRITICAL: sing-tun IP (${TUN_IP}) collides with Docker eth0 gateway (${ETH0_GW}), blackholing ALL outbound traffic! Rebuild v2.2.2+ image (uses 198.18.0.1/30 & auto-heals persisted volumes).")
+    fi
 else
     record_check "FAIL" "TUN interface (sing-tun)" "DOWN"
 fi

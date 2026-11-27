@@ -29,9 +29,9 @@
       "tag": "tun-in",
       "interface_name": "sing-tun",
       "address": [
-        "172.19.0.1/30"
+        "198.18.0.1/30"
       ],
-      "mtu": 1400,
+      "mtu": 1280,
       "auto_route": true,
       "strict_route": true,
       "stack": "gvisor",

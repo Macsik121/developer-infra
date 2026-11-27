@@ -291,6 +291,13 @@ Append-Section $netFile "Routing, DNS & Firewall (DEVINFRA_KS)" $netRouteRes.Com
 $tunUp = ($netRouteRes.Stdout -match "sing-tun:")
 if ($tunUp) {
     Record-Check "PASS" "TUN interface (sing-tun)" "UP"
+    $gwMatch = [regex]::Match($netRouteRes.Stdout, "default via (\d+\.\d+\.\d+\.\d+) dev eth0")
+    $tunIpMatch = [regex]::Match($netRouteRes.Stdout, "(?m)^sing-tun\s+\S+\s+(\d+\.\d+\.\d+\.\d+)/")
+    if ($gwMatch.Success -and $tunIpMatch.Success -and ($gwMatch.Groups[1].Value -eq $tunIpMatch.Groups[1].Value)) {
+        $collIp = $gwMatch.Groups[1].Value
+        Record-Check "FAIL" "TUN / eth0 subnet collision" ("CRITICAL: sing-tun stole Docker gateway IP " + $collIp + "!")
+        [void]$hints.Add(("CRITICAL: sing-tun IP (" + $collIp + ") collides with Docker eth0 gateway (" + $collIp + "), blackholing ALL outbound traffic! Rebuild v2.2.2+ image (uses 198.18.0.1/30 & auto-heals persisted volumes)."))
+    }
 } else {
     Record-Check "FAIL" "TUN interface (sing-tun)" "DOWN"
 }

@@ -264,6 +264,17 @@ class StatusHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         return
 
+    def _send_bytes(self, status: int, content_type: str, body: bytes) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlsplit(self.path)
         q = urllib.parse.parse_qs(parsed.query)
@@ -271,39 +282,26 @@ class StatusHandler(BaseHTTPRequestHandler):
         fast = q.get("fast", ["0"])[0] == "1"
 
         if parsed.path == "/healthz":
-            body = b'{"status":"ok"}\n'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_bytes(200, "application/json; charset=utf-8", b'{"status":"ok"}\n')
             return
 
         if parsed.path == "/api/status":
             data = collect_status(force_egress=force, skip_egress=fast)
             body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_bytes(200, "application/json; charset=utf-8", body)
             return
 
         if parsed.path in {"/", "/index.html", "/status"}:
             data = collect_status(force_egress=force, skip_egress=fast)
             body = render_html(data).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_bytes(200, "text/html; charset=utf-8", body)
             return
 
-        self.send_response(404)
-        self.end_headers()
+        try:
+            self.send_response(404)
+            self.end_headers()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 def main() -> None:
