@@ -360,19 +360,83 @@ cmd_retest() {
     local secret
     secret="$(tr -d '[:space:]' < "$secret_file")"
     echo "[vpn-ctl] Running latency test across auto-proxy nodes (timeout 5s)..."
-    curl -fsS --max-time 12 \
-        -H "Authorization: Bearer ${secret}" \
-        "${CLASH_API_URL}/group/auto-proxy/delay?timeout=5000&url=https%3A%2F%2Fwww.gstatic.com%2Fgenerate_204" \
-        | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-if not isinstance(data, dict) or not data:
+    CLASH_API_URL="$CLASH_API_URL" CLASH_SECRET="$secret" python3 -c '
+import concurrent.futures, json, os, sys, urllib.error, urllib.parse, urllib.request
+
+base = os.environ["CLASH_API_URL"].rstrip("/")
+secret = os.environ["CLASH_SECRET"]
+headers = {"Authorization": f"Bearer {secret}"}
+test_url = urllib.parse.quote("https://www.gstatic.com/generate_204", safe="")
+
+def api_get(path, timeout=8):
+    req = urllib.request.Request(f"{base}{path}", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+results = {}
+errors = []
+
+try:
+    group_data = api_get(f"/group/auto-proxy/delay?timeout=5000&url={test_url}", timeout=12)
+    if isinstance(group_data, dict):
+        for k, v in group_data.items():
+            if isinstance(v, (int, float)) and v > 0:
+                results[k] = int(v)
+except Exception as exc:
+    errors.append(str(exc))
+
+# sing-box 1.12 /group/auto-proxy/delay can return {} when urltest is busy or group check fails.
+# Fall back to parallel per-node /proxies/<tag>/delay probes so operators always get real results.
+if not results:
+    try:
+        proxies = api_get("/proxies", timeout=4).get("proxies", {})
+        members = [
+            n for n in (proxies.get("auto-proxy") or {}).get("all", [])
+            if n not in {"auto-proxy", "proxy-select", "direct"}
+        ]
+    except Exception as exc:
+        print(f"[vpn-ctl] ERROR querying Clash API: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    def probe_one(tag):
+        qtag = urllib.parse.quote(tag, safe="")
+        try:
+            d = api_get(f"/proxies/{qtag}/delay?timeout=5000&url={test_url}", timeout=6)
+            delay = d.get("delay") if isinstance(d, dict) else None
+            if isinstance(delay, (int, float)) and delay > 0:
+                return tag, int(delay), ""
+            return tag, 0, str((d or {}).get("message", "no delay"))
+        except urllib.error.HTTPError as he:
+            body = he.read().decode("utf-8", errors="ignore")
+            try:
+                msg = json.loads(body).get("message", body)
+            except Exception:
+                msg = body or str(he)
+            return tag, 0, str(msg).strip()
+        except Exception as exc:
+            return tag, 0, str(exc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+        for tag, ms, err in pool.map(probe_one, members):
+            if ms > 0:
+                results[tag] = ms
+            elif err:
+                errors.append(f"{tag}: {err}")
+
+items = sorted(results.items(), key=lambda x: x[1])
+if not items:
     print("No reachable nodes responded to delay test.")
+    if errors:
+        print(f"Sample errors ({len(errors)} failed):")
+        for e in errors[:5]:
+            print(f"  - {e[:140]}")
     sys.exit(0)
-items = sorted([(k, v) for k, v in data.items() if isinstance(v, (int, float)) and v > 0], key=lambda x: x[1])
-print(f"Reachable nodes: {len(items)}")
+
+print(f"Reachable nodes: {len(items)}" + (f" (failed: {len(errors)})" if errors else ""))
 for idx, (name, ms) in enumerate(items[:15], start=1):
-    print(f"  {idx:2d}. {name:<42s} {int(ms):4d} ms")
+    print(f"  {idx:2d}. {name:<42s} {ms:4d} ms")
+if errors:
+    print(f"Sample failure: {errors[0][:140]}")
 '
 }
 
@@ -442,7 +506,10 @@ cmd_status() {
     # Prefer internal read-only status API (works identically for coder & root, zero secret exposure)
     local api_json=""
     if [[ "${VPN_CTL_OFFLINE_STATUS:-0}" != "1" ]] && command -v curl >/dev/null 2>&1; then
-        api_json="$(curl -fsS --max-time 5 "${VPN_STATUS_URL}/api/status?refresh=1" 2>/dev/null || true)"
+        api_json="$(curl -fsS --max-time 8 "${VPN_STATUS_URL}/api/status?refresh=1" 2>/dev/null || true)"
+        if [[ -z "$api_json" ]]; then
+            api_json="$(curl -fsS --max-time 3 "${VPN_STATUS_URL}/api/status?fast=1" 2>/dev/null || true)"
+        fi
     fi
 
     if [[ -n "$api_json" ]]; then
@@ -452,26 +519,41 @@ d = json.load(sys.stdin)
 tun = "UP" if d.get("tun_up") else "DOWN"
 sb = "RUNNING" if d.get("singbox_running") else "STOPPED"
 sel = d.get("selector_now", "n/a")
+auto_now = d.get("auto_proxy_now", "")
 leaf = d.get("active_node", "n/a")
 delay = d.get("delay_ms")
 delay_s = f" ({delay} ms)" if delay is not None else ""
 node_str = f"{sel} -> {leaf}{delay_s}" if sel == "auto-proxy" and leaf != sel else f"{leaf}{delay_s}"
 eg = d.get("egress") or {}
 if eg.get("ok"):
-    eg_str = f"{eg.get(\"ip\", \"\")} ({eg.get(\"country\", \"?\")}) — {eg.get(\"org\", \"\")}"
+    ip = eg.get("ip", "")
+    country = eg.get("country", "?")
+    org = eg.get("org", "")
+    eg_str = f"{ip} ({country}) - {org}" if org else f"{ip} ({country})"
 else:
-    eg_str = f"FAILED ({eg.get(\"error\") or \"no egress\"})"
+    err = eg.get("error") or "no egress"
+    eg_str = f"FAILED ({err})"
 
-print(f"VPN Mode      : {d.get(\"mode\", \"unknown\")}")
-print(f"VPN State     : {d.get(\"state\", \"unknown\")}")
+mode = d.get("mode", "unknown")
+state = d.get("state", "unknown")
+tun_iface = d.get("tun_iface", "sing-tun")
+reachable = d.get("reachable_nodes", 0)
+total = d.get("total_nodes", 0)
+updater = d.get("updater_summary")
+
+print(f"VPN Mode      : {mode}")
+print(f"VPN State     : {state}")
 print(f"sing-box      : {sb}")
-print(f"TUN Interface : {d.get(\"tun_iface\", \"sing-tun\")} ({tun})")
+print(f"TUN Interface : {tun_iface} ({tun})")
 print(f"Active Node   : {node_str}")
-print(f"Reachable     : {d.get(\"reachable_nodes\", 0)} / {d.get(\"total_nodes\", 0)} nodes")
+print(f"Reachable     : {reachable} / {total} nodes")
 print(f"Live Egress   : {eg_str}")
-print(f"Dashboard URL : http://127.0.0.1:9099")
-if d.get("updater_summary"):
-    print(f"Updater       : {d[\"updater_summary\"]}")
+print("Dashboard URL : http://127.0.0.1:9099")
+if not eg.get("ok") and sel not in {"auto-proxy", "direct", "n/a", ""}:
+    auto_hint = f" (auto-proxy -> {auto_now})" if auto_now else ""
+    print(f"Hint          : Pinned node failing! Run vpn-ctl select auto-proxy{auto_hint}")
+if updater:
+    print(f"Updater       : {updater}")
 errs = d.get("recent_errors") or []
 if errs:
     print("Recent Errors :")

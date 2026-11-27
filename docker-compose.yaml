@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: ${DEV_INFRA_PROFILE:-full}
     hostname: ${COMPOSE_PROJECT_NAME:-devbox-main}
 
     # Resource limits parameterized via .env (D2):
@@ -33,6 +34,7 @@ services:
     labels:
       - "dev.infra.managed=true"
       - "dev.infra.project=${COMPOSE_PROJECT_NAME:-devbox-main}"
+      - "dev.infra.profile=${DEV_INFRA_PROFILE:-full}"
       - "dev.infra.ports=${CODE_SERVER_PORT:-8080},${NOVNC_PORT:-6901},${OMNIROUTE_PORT:-20128}"
 
     logging:
@@ -69,8 +71,10 @@ services:
       - VPN_NODE_FILTER=${VPN_NODE_FILTER:-}
       - VPN_NODE_EXCLUDE=${VPN_NODE_EXCLUDE:-}
       - VPN_FAIL_MODE=${VPN_FAIL_MODE:-strict}
+      - VPN_AUTO_FAILOVER=${VPN_AUTO_FAILOVER:-1}
       - VPN_GUI_NOTIFICATIONS=${VPN_GUI_NOTIFICATIONS:-1}
       - CHROMIUM_START_URL=${CHROMIUM_START_URL:-http://127.0.0.1:9099}
+      - CHROMIUM_DISABLE_QUIC=${CHROMIUM_DISABLE_QUIC:-1}
       - CHROMIUM_DISABLE_GPU=${CHROMIUM_DISABLE_GPU:-0}
       - OMNIROUTE_PORT=${OMNIROUTE_PORT:-20128}
       - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}

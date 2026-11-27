@@ -36,7 +36,11 @@ cp .env.example .env
 > - `VPN_MTU=1280` гарантирует работу без blackhole-фрагментации, даже если на хосте параллельно включён другой VPN/TUN.
 > - `VPN_PROBE_NODES=1` перед запуском проверяет TCP-доступность до 120 кандидатов (деприоритизируя RU/LTE/мост-ноды) и загружает в `sing-box` рабочие и быстрые ноды.
 
-### Шаг 2. Проверка портов и запуск по платформе
+### Шаг 2. Проверка портов и быстрый двухэтапный запуск (`lite` → `full`)
+
+Чтобы не ждать долгую установку тяжёлых инструментов (`Node.js 22`, `code-server`, `Claude Code`, `OmniRoute`) до проверки VPN, предусмотрены два multi-stage профиля сборки (`DEV_INFRA_PROFILE` в `.env` или флаг `-Profile` / `--profile`):
+- **`lite`** — только сеть, `sing-box` VPN, X11/noVNC и **Chromium** (~60–90 сек на первый старт).
+- **`full`** (по умолчанию) — **на 100% переиспользует BuildKit-кэш `lite`** и доставляет `code-server`, `Node.js 22`, `OmniRoute` и `Claude Code`.
 
 На Windows (особенно с Hyper-V/WinNAT) порты вроде `8080` могут попадать в системный `excludedportrange` (`WSAEACCES`). Перед запуском или автоматически при старте используйте встроенный preflight:
 
@@ -48,8 +52,12 @@ Get-ChildItem -Filter *.ps1 | Unblock-File
 # Проверить занятость портов, владельцев и наличие хостового VPN:
 .\run-env.ps1 -CheckPorts
 
-# Запустить (с автоматическим сдвигом +1 при конфликте портов):
-.\run-env.ps1 -AutoPort
+# Этап 1 (быстрый старт): поднять только VPN + Chromium и проверить сеть:
+.\run-env.ps1 -Profile lite -AutoPort -Detach
+.\diag-env.ps1
+
+# Этап 2 (после успешной проверки VPN): доставить IDE + AI-стек поверх кэша lite:
+.\run-env.ps1 -Profile full -AutoPort
 
 # Повторный запуск без пересборки образа:
 .\run-env.ps1 -NoBuild -AutoPort
@@ -57,14 +65,17 @@ Get-ChildItem -Filter *.ps1 | Unblock-File
 
 #### Windows (Hyper-V или без WSLg — только noVNC)
 ```powershell
-.\run-env.ps1 -Mode headless -AutoPort
+.\run-env.ps1 -Mode headless -Profile lite -AutoPort -Detach
+.\run-env.ps1 -Mode headless -Profile full -AutoPort
 ```
 
 #### Linux Desktop / Удалённый Linux-сервер (изолированный noVNC)
 ```bash
 chmod +x run-env.sh vpn-ctl.sh scripts/smoke-test.sh
 ./run-env.sh --check-ports
-./run-env.sh --auto-port
+./run-env.sh --profile lite --auto-port --detach
+./diag-env.sh
+./run-env.sh --profile full --auto-port
 ```
 
 #### Удалённый Linux-сервер через SSH-туннель
@@ -192,7 +203,7 @@ python3 -m unittest discover -s tests -v
 - Быстрый прогон (автоматически пропускает POSIX bash-тесты): `python -m unittest discover -s tests -v`
 - Полный 100% прогон **включая POSIX-скрипты** внутри собранного образа:
 ```powershell
-docker run --rm --entrypoint "" -v "${PWD}:/repo:ro" -w /repo devbox-main-ubuntu-dev:latest python3 -m unittest discover -s tests -v
+docker run --rm --entrypoint python3 -v "$($PWD.Path):/repo:ro" -w /repo devbox-main-ubuntu-dev:latest -m unittest discover -s tests -v
 ```
 
 ### Живой Smoke-Test и полная системная диагностика

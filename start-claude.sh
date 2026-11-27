@@ -274,6 +274,11 @@ done
 
 if ! command -v node >/dev/null 2>&1; then
     print_color "$C_RED" "ERROR: Node.js is required but not installed."
+    if [[ "${DEV_INFRA_PROFILE:-full}" == "lite" ]]; then
+        print_color "$C_YELLOW" "This container uses the 'lite' profile (VPN + Chromium only). Upgrade from host with:"
+        print_color "$C_YELLOW" "  Windows: .\\run-env.ps1 -Profile full -AutoPort"
+        print_color "$C_YELLOW" "  Linux  : ./run-env.sh --profile full --auto-port"
+    fi
     exit 1
 fi
 

@@ -1,37 +1,48 @@
-FROM ubuntu:24.04
+# syntax=docker/dockerfile:1
+# ==============================================================================
+# developer-infra — Multi-Stage BuildKit Dockerfile (v2.2.3)
+#
+# Build targets (selected via DEV_INFRA_PROFILE or `run-env --profile / -Profile`):
+#   - lite : Fast first-run image (~60-90s): networking + sing-box TUN VPN + X11/noVNC + Chromium.
+#            Use this to verify VPN subscription, routing & Chromium before installing heavy IDE/AI tools.
+#   - full : Complete dev environment (default): reuses 100% of `base-net` cache and adds
+#            python3-pip/venv, Node.js 22 LTS, code-server, Claude Code & OmniRoute.
+#
+# Cache-friendly DAG:
+#   base-net -> lite
+#   base-net -> full-deps -> full
+# Editing runtime scripts in container/ or supervisord.conf rebuilds ONLY the final COPY layer (~1s)
+# for both lite and full without invalidating Chromium, Node.js, code-server, or npm layers.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Stage 1: base-net — Core networking, sing-box, X11/noVNC, Chromium & coder user
+# ------------------------------------------------------------------------------
+FROM ubuntu:24.04 AS base-net
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Pinned component versions (D10) — override via --build-arg when upgrading
+# Pinned core versions (D10) — override via --build-arg when upgrading
 ARG TARGETARCH=amd64
 ARG SING_BOX_VERSION=1.12.8
 ARG SING_BOX_SHA256_AMD64=b41d9ae438a4367e5fd5c4aa36fe040d0c1bfe5f91f96a072eef31f61d46670c
 ARG SING_BOX_SHA256_ARM64=
-ARG CODE_SERVER_VERSION=4.146.0
-ARG CLAUDE_CODE_VERSION=2.1.331
-ARG OMNIROUTE_VERSION=3.8.54
 
-# 1. Core utilities, networking, Python, Supervisor, X11/noVNC & GUI notification stack
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Keep downloaded .deb archives inside BuildKit cache mount across rebuilds
+RUN rm -f /etc/apt/apt.conf.d/docker-clean \
+    && printf 'Binary::apt::APT::Keep-Downloaded-Packages "true";\n' > /etc/apt/apt.conf.d/keep-cache
+
+# 1. Core utilities, networking, Python runtime, Supervisor, X11/noVNC & GUI notifications
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
     curl wget git unzip nano jq ca-certificates gnupg iputils-ping dnsutils \
     iptables iproute2 supervisor dos2unix procps \
-    python3 python3-pip python3-venv \
+    python3 \
     xvfb x11vnc novnc websockify fluxbox dbus-x11 \
-    x11-apps x11-utils libnotify-bin dunst \
-    && rm -rf /var/lib/apt/lists/*
+    x11-apps x11-utils libnotify-bin dunst
 
-# 2. Node.js v22 LTS
-RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends nodejs \
-    && rm -rf /var/lib/apt/lists/*
-
-# 3. Chromium from PPA (avoids Ubuntu 24 snap package which breaks in Docker)
-RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common \
-    && add-apt-repository -y ppa:xtradeb/apps \
-    && apt-get update && apt-get install -y --no-install-recommends chromium \
-    && rm -rf /var/lib/apt/lists/*
-
-# 4. sing-box pre-baked at build time with SHA256 verification (F4, D10)
+# 2. sing-box pre-baked at build time with SHA256 verification (F4, D10)
 RUN set -eux; \
     ARCH="${TARGETARCH:-amd64}"; \
     case "$ARCH" in \
@@ -58,19 +69,17 @@ RUN set -eux; \
     rm -rf "/tmp/${TARBALL}" "/tmp/sing-box-${SING_BOX_VERSION}-linux-${ARCH}"; \
     /usr/local/bin/sing-box version
 
-# 5. code-server (pinned)
-RUN curl -fsSL https://code-server.dev/install.sh | sh -s -- --version="${CODE_SERVER_VERSION}"
+# 3. Chromium from PPA (avoids Ubuntu 24 snap package which breaks in Docker)
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends software-properties-common \
+    && add-apt-repository -y ppa:xtradeb/apps \
+    && apt-get update && apt-get install -y --no-install-recommends chromium
 
-# 6. Claude Code & OmniRoute (pinned)
-RUN npm install -g \
-    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    "omniroute@${OMNIROUTE_VERSION}" \
-    && npm cache clean --force
-
-# 7. Unprivileged developer user — NO sudo / NOPASSWD:ALL (D8)
+# 4. Unprivileged developer user — NO sudo / NOPASSWD:ALL (D8)
 RUN useradd -m -s /bin/bash coder
 
-# 8. Prepare directories with least-privilege permissions (D3, D8)
+# 5. Prepare directories with least-privilege permissions (D3, D8)
 RUN mkdir -p \
         /home/coder/workspace \
         /home/coder/.config/omniroute \
@@ -87,12 +96,18 @@ RUN mkdir -p \
     && chmod 700 /var/lib/sing-box /home/coder/.xdg /home/coder/.claude \
     && chmod 750 /var/log/supervisor
 
-# 8a. UTF-8 locale (placed after heavy layers so Docker build cache stays intact, ST-LIVE-4)
+# 6. UTF-8 locale (ST-LIVE-4)
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     TERM=xterm-256color
 
-# 9. Install container runtime scripts & configs
+# ------------------------------------------------------------------------------
+# Stage 2: lite — Fast VPN + Chromium verification target (no Node/IDE/AI stack)
+# ------------------------------------------------------------------------------
+FROM base-net AS lite
+
+ENV DEV_INFRA_PROFILE=lite
+
 COPY container/ /usr/local/lib/dev-infra/
 COPY ./sing-box/open-chromium.sh /etc/sing-box/open-chromium.sh
 COPY ./sing-box/test-connection.sh /etc/sing-box/test-connection.sh
@@ -124,6 +139,72 @@ RUN chmod 0755 \
 EXPOSE 8080 6080 20128
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD /bin/bash -c 'curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null && (ip link show sing-tun >/dev/null 2>&1 || grep -Eq "^(direct|proxy)$" /run/vpn/mode 2>/dev/null)'
+    CMD /bin/bash -c 'curl -fsS --max-time 3 http://127.0.0.1:9099/healthz >/dev/null && (! command -v code-server >/dev/null 2>&1 || curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null) && (ip link show sing-tun >/dev/null 2>&1 || grep -Eq "^(direct|proxy)$" /run/vpn/mode 2>/dev/null)'
+
+ENTRYPOINT ["/usr/local/lib/dev-infra/entrypoint.sh"]
+
+# ------------------------------------------------------------------------------
+# Stage 3: full-deps — Heavy IDE & AI toolchain (reuses 100% of base-net cache)
+# ------------------------------------------------------------------------------
+FROM base-net AS full-deps
+
+ARG CODE_SERVER_VERSION=4.146.0
+ARG CLAUDE_CODE_VERSION=2.1.331
+ARG OMNIROUTE_VERSION=3.8.54
+
+# 7. Python dev tooling & Node.js v22 LTS
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends python3-pip python3-venv nodejs
+
+# 8. code-server (pinned)
+RUN curl -fsSL https://code-server.dev/install.sh | sh -s -- --version="${CODE_SERVER_VERSION}"
+
+# 9. Claude Code & OmniRoute (pinned)
+RUN --mount=type=cache,target=/root/.npm \
+    npm install -g \
+    "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    "omniroute@${OMNIROUTE_VERSION}"
+
+# ------------------------------------------------------------------------------
+# Stage 4: full — Complete developer-infra image (default final stage)
+# ------------------------------------------------------------------------------
+FROM full-deps AS full
+
+ENV DEV_INFRA_PROFILE=full
+
+COPY container/ /usr/local/lib/dev-infra/
+COPY ./sing-box/open-chromium.sh /etc/sing-box/open-chromium.sh
+COPY ./sing-box/test-connection.sh /etc/sing-box/test-connection.sh
+COPY ./sing-box/setup-vpn.sh /etc/sing-box/setup-vpn.sh
+COPY ./sing-box/config.json.example /etc/sing-box/config.json.example
+COPY ./start-claude.sh /usr/local/bin/start-claude
+COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY novnc-index.html /usr/share/novnc/index.html
+
+RUN chmod 0755 \
+        /usr/local/lib/dev-infra/entrypoint.sh \
+        /usr/local/lib/dev-infra/display-detect.sh \
+        /usr/local/lib/dev-infra/wait-for-tun.sh \
+        /usr/local/lib/dev-infra/start-chromium.sh \
+        /usr/local/lib/dev-infra/vpn-ctl.sh \
+        /usr/local/lib/dev-infra/vpn-watchdog.sh \
+        /usr/local/lib/dev-infra/vpn-sub-updater.py \
+        /usr/local/lib/dev-infra/vpn-status-server.py \
+        /usr/local/bin/start-claude \
+        /etc/sing-box/open-chromium.sh \
+        /etc/sing-box/test-connection.sh \
+        /etc/sing-box/setup-vpn.sh \
+    && chmod 0644 /usr/local/lib/dev-infra/bashrc-vpn-banner.sh \
+    && ln -sf /usr/local/lib/dev-infra/vpn-ctl.sh /usr/local/bin/vpn-ctl \
+    && ln -sf /usr/local/lib/dev-infra/start-chromium.sh /usr/local/bin/open-chromium \
+    && ln -sf /usr/local/bin/start-claude /usr/local/bin/start-claude.sh \
+    && printf '\n# developer-infra VPN status banner\n[ -r /usr/local/lib/dev-infra/bashrc-vpn-banner.sh ] && . /usr/local/lib/dev-infra/bashrc-vpn-banner.sh\n' >> /etc/bash.bashrc
+
+EXPOSE 8080 6080 20128
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD /bin/bash -c 'curl -fsS --max-time 3 http://127.0.0.1:9099/healthz >/dev/null && (! command -v code-server >/dev/null 2>&1 || curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null) && (ip link show sing-tun >/dev/null 2>&1 || grep -Eq "^(direct|proxy)$" /run/vpn/mode 2>/dev/null)'
 
 ENTRYPOINT ["/usr/local/lib/dev-infra/entrypoint.sh"]

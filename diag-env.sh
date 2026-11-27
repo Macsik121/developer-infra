@@ -122,7 +122,9 @@ if [[ -z "$CONTAINER_ID" ]]; then
     echo "Created files: ${SUMMARY_FILE}, ${SVC_FILE}"
     exit 1
 fi
-record_check "PASS" "Container ubuntu-dev" "running (id=${CONTAINER_ID:0:12})"
+CONTAINER_PROFILE="$(docker exec -u coder "$CONTAINER_ID" printenv DEV_INFRA_PROFILE 2>/dev/null | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' || echo "full")"
+[[ "$CONTAINER_PROFILE" == "lite" || "$CONTAINER_PROFILE" == "full" ]] || CONTAINER_PROFILE="full"
+record_check "PASS" "Container ubuntu-dev" "running (id=${CONTAINER_ID:0:12}, profile=${CONTAINER_PROFILE})"
 
 step_msg "[1/4.2] Running supervisorctl status..."
 SUP_OUT="$(docker exec -u root "$CONTAINER_ID" supervisorctl status 2>&1 || true)"
@@ -131,16 +133,21 @@ append_section "$SVC_FILE" "supervisorctl status" "$SUP_OUT"
 step_msg "[1/4.3] Checking active DISPLAY & locale..."
 ACTIVE_DISP="$(docker exec -u coder "$CONTAINER_ID" /usr/local/lib/dev-infra/display-detect.sh 2>/dev/null | tr -d '\r\n' || echo "unknown")"
 LOCALE_OUT="$(docker exec -u coder "$CONTAINER_ID" locale 2>&1 || true)"
-append_section "$SVC_FILE" "Active DISPLAY & Locale" "DISPLAY=${ACTIVE_DISP}"$'\n'"${LOCALE_OUT}"
+append_section "$SVC_FILE" "Active DISPLAY & Locale" "PROFILE=${CONTAINER_PROFILE}"$'\n'"DISPLAY=${ACTIVE_DISP}"$'\n'"${LOCALE_OUT}"
 
 CORE_DOWN=()
-for svc in vpn-sub-updater sing-box vpn-status vpn-watchdog code-server omniroute; do
+if [[ "$CONTAINER_PROFILE" == "lite" ]]; then
+    REQ_SVCS=(vpn-sub-updater sing-box vpn-status vpn-watchdog)
+else
+    REQ_SVCS=(vpn-sub-updater sing-box vpn-status vpn-watchdog code-server omniroute)
+fi
+for svc in "${REQ_SVCS[@]}"; do
     if ! printf '%s\n' "$SUP_OUT" | grep -Eq "^${svc}[[:space:]]+RUNNING"; then
         CORE_DOWN+=("$svc")
     fi
 done
 if [[ ${#CORE_DOWN[@]} -eq 0 ]]; then
-    record_check "PASS" "supervisord services" "All core services RUNNING (DISPLAY=${ACTIVE_DISP})"
+    record_check "PASS" "supervisord services" "All core services RUNNING (profile=${CONTAINER_PROFILE}, DISPLAY=${ACTIVE_DISP})"
 else
     record_check "FAIL" "supervisord core services" "Not RUNNING: ${CORE_DOWN[*]}"
 fi
@@ -237,17 +244,22 @@ fi
 
 step_msg "[2/4.6] Checking local loopback services (8080 / 9099 / ${OMNI_PORT})..."
 LOCAL_OUT="$(docker exec -u coder "$CONTAINER_ID" bash -c \
-    "printf 'code-server(8080): '; curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && echo OK || echo FAIL; printf 'vpn-status(9099): '; (curl -fsS --max-time 2 http://127.0.0.1:9099/healthz >/dev/null 2>&1 || curl -fsS --max-time 6 'http://127.0.0.1:9099/api/status?fast=1' >/dev/null 2>&1) && echo OK || echo FAIL; printf 'omniroute(${OMNI_PORT}): '; curl -fsS --max-time 2 http://127.0.0.1:${OMNI_PORT} >/dev/null 2>&1 && echo OK || echo FAIL" \
+    "printf 'code-server(8080): '; if command -v code-server >/dev/null 2>&1; then curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && echo OK || echo FAIL; else echo 'SKIP(lite)'; fi; printf 'vpn-status(9099): '; (curl -fsS --max-time 2 http://127.0.0.1:9099/healthz >/dev/null 2>&1 || curl -fsS --max-time 6 'http://127.0.0.1:9099/api/status?fast=1' >/dev/null 2>&1) && echo OK || echo FAIL; printf 'omniroute(${OMNI_PORT}): '; if command -v omniroute >/dev/null 2>&1; then curl -fsS --max-time 2 http://127.0.0.1:${OMNI_PORT} >/dev/null 2>&1 && echo OK || echo FAIL; else echo 'SKIP(lite)'; fi" \
     2>&1 || true)"
 append_section "$NET_FILE" "Internal Loopback Services" "$LOCAL_OUT"
-record_check "$(printf '%s' "$LOCAL_OUT" | grep -q 'code-server(8080):.*OK' && echo PASS || echo FAIL)" "Local services (8080/9099/${OMNI_PORT})" "$(printf '%s' "$LOCAL_OUT" | tr '\n' ' ')"
+if [[ "$CONTAINER_PROFILE" == "lite" ]]; then
+    record_check "$(printf '%s' "$LOCAL_OUT" | grep -q 'vpn-status(9099):.*OK' && echo PASS || echo FAIL)" "Local services (8080/9099/${OMNI_PORT})" "$(printf '%s' "$LOCAL_OUT" | tr '\n' ' ')"
+else
+    record_check "$(printf '%s' "$LOCAL_OUT" | grep -q 'code-server(8080):.*OK' && echo PASS || echo FAIL)" "Local services (8080/9099/${OMNI_PORT})" "$(printf '%s' "$LOCAL_OUT" | tr '\n' ' ')"
+fi
 
 # 3. VPN-CTL & Redacted Active Config + Direct SO_MARK=255 Probe
 echo "[3/4] Running vpn-ctl audit & direct upstream SO_MARK=255 probe..."
 step_msg "[3/4.1] Running vpn-ctl status..."
 append_section "$VPN_FILE" "vpn-ctl status" "$(docker exec -u root "$CONTAINER_ID" /usr/local/bin/vpn-ctl status 2>&1 || true)"
 step_msg "[3/4.2] Running vpn-ctl select (active node & pool list)..."
-append_section "$VPN_FILE" "vpn-ctl select" "$(docker exec -u root "$CONTAINER_ID" /usr/local/bin/vpn-ctl select 2>&1 || true)"
+VPN_SELECT_OUT="$(docker exec -u root "$CONTAINER_ID" /usr/local/bin/vpn-ctl select 2>&1 || true)"
+append_section "$VPN_FILE" "vpn-ctl select" "$VPN_SELECT_OUT"
 if [[ "$SKIP_RETEST" -eq 0 ]]; then
     step_msg "[3/4.3] Running vpn-ctl retest (Clash API latency sweep, up to 12s)..."
     append_section "$VPN_FILE" "vpn-ctl retest" "$(docker exec -u root "$CONTAINER_ID" /usr/local/bin/vpn-ctl retest 2>&1 || true)"
@@ -257,7 +269,7 @@ fi
 
 step_msg "[3/4.4] Inspecting config.active.json & probing 5 TCP nodes directly with SO_MARK=255..."
 CFG_AUDIT="$(docker exec -i -u root "$CONTAINER_ID" python3 - <<'PYEOF' 2>&1 || true
-import json, socket, time
+import ipaddress, json, socket, time
 from pathlib import Path
 
 cfg_path = Path("/var/lib/sing-box/config.active.json")
@@ -286,9 +298,25 @@ print("FIRST_10_NODES:")
 for i, p in enumerate(proxies[:10], 1):
     print(f"  {i:2d}. [{p.get('type')}] {p.get('tag')} -> {p.get('server')}:{p.get('server_port')}")
 
+reality_nodes = [p for p in proxies if p.get("type") == "vless" and (p.get("tls") or {}).get("reality", {}).get("enabled")]
+if reality_nodes:
+    print("\nVLESS_REALITY_META (redacted, first 3 nodes):")
+    for p in reality_nodes[:3]:
+        tls = p.get("tls") or {}
+        rel = tls.get("reality") or {}
+        utls = tls.get("utls") or {}
+        pbk = str(rel.get("public_key") or "")
+        sid = str(rel.get("short_id") or "")
+        print(
+            f"  - {p.get('tag')}: sni={tls.get('server_name')}, fp={utls.get('fingerprint')}, "
+            f"utls={bool(utls.get('enabled'))}, flow={p.get('flow') or 'none'}, "
+            f"pbk_len={len(pbk)}, pbk_has_space={' ' in pbk}, sid_len={len(sid)}"
+        )
+
 print("\nDIRECT_TCP_PROBE_WITH_SO_MARK_255 (first 5 TCP nodes):")
 tcp_nodes = [p for p in proxies if p.get("type") != "hysteria2"][:5]
 ok_cnt = 0
+pub_rtts = []
 for p in tcp_nodes:
     host, port = p.get("server"), int(p.get("server_port", 443))
     t0 = time.monotonic()
@@ -302,12 +330,20 @@ for p in tcp_nodes:
         s.connect((host, port))
         ms = int((time.monotonic() - t0) * 1000)
         ok_cnt += 1
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            if not ip_obj.is_private:
+                pub_rtts.append(ms)
+        except ValueError:
+            pass
         print(f"  [OK]   {p.get('tag')} ({host}:{port}) {ms} ms")
     except Exception as e:
         print(f"  [FAIL] {p.get('tag')} ({host}:{port}) -> {e}")
     finally:
         s.close()
 print(f"DIRECT_TCP_OK={ok_cnt}/{len(tcp_nodes)}")
+if pub_rtts and all(r <= 8 for r in pub_rtts):
+    print("LOCAL_SYN_ACK_SUSPECT=1")
 PYEOF
 )"
 append_section "$VPN_FILE" "Redacted config.active.json & Direct SO_MARK=255 Probe" "$CFG_AUDIT"
@@ -322,12 +358,19 @@ else
 fi
 
 if [[ "$L7_TUN_OK" -eq 0 ]]; then
+    ACTIVE_SEL="$(printf '%s\n' "$VPN_SELECT_OUT" | sed -n 's/^Active Selector[[:space:]]*:[[:space:]]*//p' | head -n 1)"
+    if [[ -n "$ACTIVE_SEL" && "$ACTIVE_SEL" != auto-proxy* && "$ACTIVE_SEL" != "direct" ]]; then
+        HINTS+=("Active selector is pinned to failing manual node '${ACTIVE_SEL}'. Run ./vpn-ctl.sh select auto-proxy (v2.2.3 watchdog auto-recovers this).")
+    fi
     if [[ "$L7_PRX_OK" -eq 1 ]]; then
         HINTS+=("Internal proxy 127.0.0.1:2080 WORKS while TUN failed -> try ./vpn-ctl.sh proxy + open-chromium --proxy.")
     elif printf '%s' "$CFG_AUDIT" | grep -q "DIRECT_TCP_OK=0/"; then
         HINTS+=("Direct TCP (SO_MARK=255) failed to ALL tested nodes. Run ./vpn-ctl.sh update or check host VPN.")
     else
         HINTS+=("Inspect ${LOGS_FILE} (sing-box.err.log) and ${VPN_FILE} for TLS/VLESS handshake errors.")
+    fi
+    if printf '%s' "$CFG_AUDIT" | grep -q "LOCAL_SYN_ACK_SUSPECT=1"; then
+        HINTS+=("Direct TCP probes returned <=8ms to public IPs (typical of host VPN gVisor TUN local SYN-ACK) - raw TCP connect cannot prove VLESS Reality handshakes succeed.")
     fi
 fi
 
@@ -338,6 +381,9 @@ if [[ -f "${SCRIPT_DIR}/collect-logs.sh" ]]; then
     [[ "$LOG_SCOPE" != "ask" ]] && COLLECT_ARGS+=(--scope "$LOG_SCOPE")
     bash "${SCRIPT_DIR}/collect-logs.sh" "${COLLECT_ARGS[@]}"
     record_check "PASS" "Supervisor logs collected" "Saved to ${LOG_FILENAME}"
+    if [[ "$L7_TUN_OK" -eq 0 ]] && [[ -f "$LOGS_FILE" ]] && grep -q "reality verification failed" "$LOGS_FILE"; then
+        HINTS+=("Detected 'reality verification failed' in sing-box.err.log: VLESS Reality handshake rejected by server or intercepted by host VPN/DPI. Switch to auto-proxy (Hysteria2 fallback) or run ./vpn-ctl.sh update.")
+    fi
 else
     record_check "WARN" "Supervisor logs collected" "collect-logs.sh not found next to diag-env.sh"
 fi
@@ -348,6 +394,7 @@ fi
     echo "developer-infra System Diagnostic Summary"
     echo "Timestamp : $(date '+%Y-%m-%d %H:%M:%S')"
     echo "EnvFile   : ${ENV_FILE}"
+    echo "Profile   : ${CONTAINER_PROFILE}"
     echo "========================================================================"
     echo ""
     echo "Check Results:"

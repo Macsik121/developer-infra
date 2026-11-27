@@ -364,6 +364,26 @@ class TestVpnSubUpdater(unittest.TestCase):
         self.assertEqual(ips, ["203.0.113.42"])
         self.assertEqual(updater._parse_dns_a_response(header + question + answer, 0x1111), [])
 
+    def test_vless_reality_preserves_plus_in_pbk_defaults_utls_and_uses_doh_remote(self):
+        uri = (
+            "vless://11111111-1111-4111-8111-111111111111@nl2.example.net:443"
+            "?encryption=none&flow=xtls-rprx-vision"
+            "&pbk=AbCd+EfGh1234567890&security=reality&sid=abcd&sni=www.cloudflare.com&type=tcp#NL-PlusKey"
+        )
+        nodes, _ = updater.parse_subscription_uris([uri], allow_insecure=False)
+        self.assertEqual(len(nodes), 1)
+        tls = nodes[0]["tls"]
+        self.assertEqual(tls["reality"]["public_key"], "AbCd+EfGh1234567890")
+        self.assertEqual(tls["utls"], {"enabled": True, "fingerprint": "chrome"})
+
+        cfg = updater.build_singbox_config(nodes, clash_secret="sec")
+        dns_remote = next(s for s in cfg["dns"]["servers"] if s["tag"] == "dns-remote")
+        self.assertEqual(dns_remote["type"], "https")
+        self.assertEqual(dns_remote["server_port"], 443)
+        self.assertEqual(dns_remote["path"], "/dns-query")
+        self.assertEqual(dns_remote["detour"], "proxy-select")
+
 
 if __name__ == "__main__":
     unittest.main()
+

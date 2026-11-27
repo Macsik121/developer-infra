@@ -12,7 +12,9 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -27,6 +29,7 @@ CLASH_API_URL = os.environ.get("CLASH_API_URL", "http://127.0.0.1:9090")
 TUN_IFACE = os.environ.get("VPN_TUN_IFACE", "sing-tun")
 SUPERVISOR_LOG_DIR = os.environ.get("DEV_INFRA_SUPERVISOR_LOG_DIR", "/var/log/supervisor")
 
+_EGRESS_LOCK = threading.Lock()
 _EGRESS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
 EGRESS_CACHE_TTL = 15.0
 
@@ -101,16 +104,55 @@ def resolve_active_node(proxies: Dict[str, Any]) -> Tuple[str, str, Optional[int
     return sel_now, leaf, delay_ms, reachable, len(all_nodes)
 
 
-def probe_egress(force: bool = False) -> Dict[str, Any]:
-    now = time.monotonic()
-    if not force and _EGRESS_CACHE["data"] is not None and (now - _EGRESS_CACHE["ts"]) < EGRESS_CACHE_TTL:
-        return _EGRESS_CACHE["data"]
-
+def _probe_egress_once() -> Dict[str, Any]:
+    """
+    Bounded L7 HTTPS egress probe.
+    Prefers `curl -4 --max-time 3` because Python's urllib/glibc getaddrinfo() ignores
+    socket timeouts during DNS retries (blocking 5-10s when TUN DNS is broken).
+    """
     result: Dict[str, Any] = {"ok": False, "ip": "", "country": "", "org": "", "error": ""}
+    curl_bin = shutil.which("curl")
+    if curl_bin:
+        try:
+            proc = subprocess.run(
+                [
+                    curl_bin,
+                    "-4",
+                    "-fsS",
+                    "--max-time",
+                    "3",
+                    "-H",
+                    "User-Agent: developer-infra-status/2.2",
+                    "-H",
+                    "Accept: application/json",
+                    "https://ipinfo.io/json",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3.5,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                payload = json.loads(proc.stdout)
+                if isinstance(payload, dict) and payload.get("ip"):
+                    result["ok"] = True
+                    result["ip"] = str(payload.get("ip", ""))
+                    result["country"] = str(payload.get("country", ""))
+                    result["org"] = str(payload.get("org", ""))
+                    return result
+            err_msg = (proc.stderr or proc.stdout or f"curl exit {proc.returncode}").strip()
+            result["error"] = err_msg.splitlines()[-1][:180] if err_msg else f"curl exit {proc.returncode}"
+            return result
+        except subprocess.TimeoutExpired:
+            result["error"] = "egress/DNS probe timed out (>3.5s)"
+            return result
+        except Exception as exc:
+            result["error"] = str(exc)[:180]
+            return result
+
     try:
         req = urllib.request.Request(
             "https://ipinfo.io/json",
-            headers={"User-Agent": "developer-infra-status/2.1", "Accept": "application/json"},
+            headers={"User-Agent": "developer-infra-status/2.2", "Accept": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
             payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
@@ -120,10 +162,31 @@ def probe_egress(force: bool = False) -> Dict[str, Any]:
             result["org"] = str(payload.get("org", ""))
     except Exception as exc:
         result["error"] = str(exc)[:180]
-
-    _EGRESS_CACHE["ts"] = now
-    _EGRESS_CACHE["data"] = result
     return result
+
+
+def probe_egress(force: bool = False) -> Dict[str, Any]:
+    now = time.monotonic()
+    with _EGRESS_LOCK:
+        cached = _EGRESS_CACHE["data"]
+        cached_ts = _EGRESS_CACHE["ts"]
+    if not force and cached is not None and (now - cached_ts) < EGRESS_CACHE_TTL:
+        return cached
+
+    result = _probe_egress_once()
+    with _EGRESS_LOCK:
+        _EGRESS_CACHE["ts"] = time.monotonic()
+        _EGRESS_CACHE["data"] = result
+    return result
+
+
+def _background_egress_refresher() -> None:
+    while True:
+        try:
+            probe_egress(force=True)
+        except Exception:
+            pass
+        time.sleep(EGRESS_CACHE_TTL)
 
 
 def tail_singbox_errors(limit: int = 8) -> List[str]:
@@ -162,8 +225,11 @@ def collect_status(force_egress: bool = False, skip_egress: bool = False) -> Dic
     sb_running = is_singbox_running()
     proxies = query_clash_proxies()
     sel_now, leaf_node, delay_ms, reachable_count, total_nodes = resolve_active_node(proxies)
+    auto_proxy_now = (proxies.get("auto-proxy") or {}).get("now") or ""
     if skip_egress:
-        egress = _EGRESS_CACHE["data"] or {"ok": False, "ip": "", "country": "", "org": "", "error": "fast-mode (skipped)"}
+        with _EGRESS_LOCK:
+            cached = _EGRESS_CACHE["data"]
+        egress = cached or {"ok": False, "ip": "", "country": "", "org": "", "error": "fast-mode (skipped)"}
     else:
         egress = probe_egress(force=force_egress)
 
@@ -175,6 +241,7 @@ def collect_status(force_egress: bool = False, skip_egress: bool = False) -> Dic
         "tun_up": tun_up,
         "singbox_running": sb_running,
         "selector_now": sel_now,
+        "auto_proxy_now": auto_proxy_now,
         "active_node": leaf_node,
         "delay_ms": delay_ms,
         "reachable_nodes": reachable_count,
@@ -305,6 +372,7 @@ class StatusHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    threading.Thread(target=_background_egress_refresher, name="egress-refresher", daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), StatusHandler)
     print(f"[vpn-status] Listening on http://{HOST}:{PORT}", flush=True)
     server.serve_forever()
@@ -312,3 +380,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

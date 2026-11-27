@@ -46,13 +46,21 @@ fi
 
 # 2. Supervisor core services & display-aware GUI checks
 ACTIVE_DISPLAY="$(dc_coder /usr/local/lib/dev-infra/display-detect.sh 2>/dev/null | tr -d '\r\n' || echo ":99")"
+CONTAINER_PROFILE="$(dc_coder printenv DEV_INFRA_PROFILE 2>/dev/null | tr -d '\r\n' | tr '[:upper:]' '[:lower:]' || echo "full")"
+[[ "$CONTAINER_PROFILE" == "lite" || "$CONTAINER_PROFILE" == "full" ]] || CONTAINER_PROFILE="full"
 SUP_OUT="$(dc_root supervisorctl status 2>&1 || true)"
 
-for svc in vpn-sub-updater sing-box vpn-status vpn-watchdog code-server omniroute; do
+if [[ "$CONTAINER_PROFILE" == "lite" ]]; then
+    CORE_SVCS=(vpn-sub-updater sing-box vpn-status vpn-watchdog)
+else
+    CORE_SVCS=(vpn-sub-updater sing-box vpn-status vpn-watchdog code-server omniroute)
+fi
+
+for svc in "${CORE_SVCS[@]}"; do
     if echo "$SUP_OUT" | grep -E "^${svc}[[:space:]]+RUNNING" >/dev/null; then
-        pass "supervisord core service '${svc}' is RUNNING"
+        pass "supervisord core service '${svc}' is RUNNING (profile=${CONTAINER_PROFILE})"
     else
-        fail "supervisord core service '${svc}' is NOT RUNNING"
+        fail "supervisord core service '${svc}' is NOT RUNNING (profile=${CONTAINER_PROFILE})"
     fi
 done
 
@@ -95,10 +103,14 @@ else
 fi
 
 # 4. Local services inside container
-if dc_coder curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
-    pass "code-server /healthz responds on 8080"
+if [[ "$CONTAINER_PROFILE" == "lite" ]]; then
+    pass "lite profile active — code-server and OmniRoute intentionally skipped"
 else
-    fail "code-server /healthz did not respond"
+    if dc_coder curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+        pass "code-server /healthz responds on 8080"
+    else
+        fail "code-server /healthz did not respond"
+    fi
 fi
 
 if [[ "$ACTIVE_DISPLAY" != ":0" ]]; then
@@ -111,12 +123,14 @@ else
     pass "WSLg mode (:0) active — noVNC skipped as designed"
 fi
 
-OMNI_PORT="$(grep -E '^OMNIROUTE_PORT=' "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2- | tr -d '\r' || true)"
-OMNI_PORT="${OMNI_PORT:-20128}"
-if dc_coder curl -fsS --max-time 3 "http://127.0.0.1:${OMNI_PORT}" >/dev/null 2>&1; then
-    pass "Supervised OmniRoute responds on ${OMNI_PORT}"
-else
-    fail "OmniRoute did not respond on ${OMNI_PORT}"
+if [[ "$CONTAINER_PROFILE" != "lite" ]]; then
+    OMNI_PORT="$(grep -E '^OMNIROUTE_PORT=' "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2- | tr -d '\r' || true)"
+    OMNI_PORT="${OMNI_PORT:-20128}"
+    if dc_coder curl -fsS --max-time 3 "http://127.0.0.1:${OMNI_PORT}" >/dev/null 2>&1; then
+        pass "Supervised OmniRoute responds on ${OMNI_PORT}"
+    else
+        fail "OmniRoute did not respond on ${OMNI_PORT}"
+    fi
 fi
 
 # 5. Security hardening checks (D8, D9)
@@ -166,10 +180,12 @@ if [[ "$TEST_KILLSWITCH" -eq 1 ]]; then
     else
         pass "Kill-switch blocked DNS resolution (no 127.0.0.11 NAT bypass) while sing-box was stopped"
     fi
-    if dc_coder curl -fsS --max-time 3 http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
-        pass "code-server remained reachable while kill-switch was active"
+    LOCAL_HEALTH_URL="http://127.0.0.1:8080/healthz"
+    [[ "$CONTAINER_PROFILE" == "lite" ]] && LOCAL_HEALTH_URL="http://127.0.0.1:9099/healthz"
+    if dc_coder curl -fsS --max-time 3 "$LOCAL_HEALTH_URL" >/dev/null 2>&1; then
+        pass "Local service (${LOCAL_HEALTH_URL}) remained reachable while kill-switch was active"
     else
-        fail "code-server became unreachable during kill-switch"
+        fail "Local service (${LOCAL_HEALTH_URL}) became unreachable during kill-switch"
     fi
     dc_root supervisorctl start sing-box >/dev/null
     sleep 4

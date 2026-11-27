@@ -189,8 +189,11 @@ def parse_vless_uri(
     sni = (q.get("sni") or host).strip()
     fp = (q.get("fp") or "").strip()
     flow = (q.get("flow") or "").strip()
-    pbk = (q.get("pbk") or "").strip()
+    # urllib.parse.parse_qs turns unescaped '+' in query strings into spaces;
+    # restore '+' so standard-base64 Reality public keys are never corrupted.
+    pbk = (q.get("pbk") or "").strip().replace(" ", "+")
     sid = (q.get("sid") or "").strip()
+    alpn_raw = (q.get("alpn") or "").strip()
     pcs = (q.get("pcs") or "").strip()
     service_name = (q.get("serviceName") or q.get("path") or "").strip()
 
@@ -224,12 +227,12 @@ def parse_vless_uri(
             "enabled": True,
             "server_name": sni,
         }
-        if fp:
-            tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
         if security == "reality":
             if not pbk:
                 stats["skipped_invalid"] += 1
                 return None
+            # sing-box requires uTLS enabled for Reality; default to chrome if URI omitted fp=
+            tls_cfg["utls"] = {"enabled": True, "fingerprint": fp or "chrome"}
             reality_cfg: Dict[str, Any] = {
                 "enabled": True,
                 "public_key": pbk,
@@ -237,8 +240,15 @@ def parse_vless_uri(
             if sid:
                 reality_cfg["short_id"] = sid
             tls_cfg["reality"] = reality_cfg
-        elif insecure_flag and allow_insecure:
-            tls_cfg["insecure"] = True
+        else:
+            if fp:
+                tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
+            if alpn_raw:
+                alpn_list = [item.strip() for item in alpn_raw.split(",") if item.strip()]
+                if alpn_list:
+                    tls_cfg["alpn"] = alpn_list
+            if insecure_flag and allow_insecure:
+                tls_cfg["insecure"] = True
         outbound["tls"] = tls_cfg
 
     if net_type == "grpc":
@@ -808,9 +818,10 @@ def build_singbox_config(
             "servers": [
                 {
                     "tag": "dns-remote",
-                    "type": "tls",
+                    "type": "https",
                     "server": "1.1.1.1",
-                    "server_port": 853,
+                    "server_port": 443,
+                    "path": "/dns-query",
                     "detour": "proxy-select",
                 },
                 {

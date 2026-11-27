@@ -83,6 +83,9 @@ class TestContainerScripts(unittest.TestCase):
             self.assertFalse(lock.exists())
             self.assertTrue(out.startswith("XDG=|DISP=:0|"), out)
             self.assertIn("--ozone-platform=x11", out)
+            self.assertIn("--disable-features=dbus,DnsOverHttps", out)
+            self.assertIn("--force-webrtc-ip-handling-policy=disable_non_proxied_udp", out)
+            self.assertIn("--disable-quic", out)
             self.assertIn("http://127.0.0.1:9099", out)
             self.assertNotIn("--disable-software-rasterizer", out)
 
@@ -255,6 +258,126 @@ class TestContainerScripts(unittest.TestCase):
         self.assertIn("203.0.113.10", html_out)
         self.assertIn("NL-1 (115 ms)", html_out)
 
+    @unittest.skipIf(os.name == "nt", "POSIX shell test — run inside Docker container on Windows")
+    def test_vpn_ctl_online_status_parses_api_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            bin_dir.mkdir()
+            payload_file = Path(td) / "status.json"
+            payload_file.write_text(
+                '{"mode":"strict","state":"UP","tun_iface":"sing-tun","tun_up":true,'
+                '"singbox_running":true,"selector_now":"auto-proxy","active_node":"NL-1",'
+                '"delay_ms":115,"reachable_nodes":12,"total_nodes":30,'
+                '"egress":{"ok":true,"ip":"203.0.113.10","country":"NL","org":"AS64500 Example"},'
+                '"updater_summary":"selected=30","recent_errors":[]}',
+                encoding="utf-8",
+            )
+            self._make_exec(bin_dir / "curl", f'#!/bin/sh\ncat "{payload_file}"\n')
+
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}:{env['PATH']}"
+            env.pop("VPN_CTL_OFFLINE_STATUS", None)
+
+            res = subprocess.run(
+                ["bash", str(ROOT / "container/vpn-ctl.sh"), "status"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("VPN Mode      : strict", res.stdout)
+            self.assertIn("Active Node   : auto-proxy -> NL-1 (115 ms)", res.stdout)
+            self.assertIn("Live Egress   : 203.0.113.10 (NL) - AS64500 Example", res.stdout)
+            self.assertIn("Updater       : selected=30", res.stdout)
+
+            # Also verify degraded egress branch
+            payload_file.write_text(
+                '{"mode":"strict","state":"DEGRADED_NO_EGRESS","tun_iface":"sing-tun","tun_up":true,'
+                '"singbox_running":true,"selector_now":"auto-proxy","active_node":"NL-1",'
+                '"delay_ms":null,"reachable_nodes":0,"total_nodes":30,'
+                '"egress":{"ok":false,"error":"timed out"},"recent_errors":["err1"]}',
+                encoding="utf-8",
+            )
+            res2 = subprocess.run(
+                ["bash", str(ROOT / "container/vpn-ctl.sh"), "status"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res2.returncode, 0, res2.stderr)
+            self.assertIn("Live Egress   : FAILED (timed out)", res2.stdout)
+            self.assertIn("  - err1", res2.stdout)
+
+    def test_all_inline_python_snippets_compile(self):
+        import re
+
+        sh_files = (
+            list((ROOT / "container").glob("*.sh"))
+            + list((ROOT / "scripts").glob("*.sh"))
+            + list(ROOT.glob("*.sh"))
+        )
+        pattern = re.compile(r"python3\s+-c\s+'([^']*)'", re.DOTALL)
+        checked = 0
+        for sh_path in sh_files:
+            text = sh_path.read_text(encoding="utf-8")
+            for idx, m in enumerate(pattern.finditer(text), start=1):
+                code = m.group(1)
+                compile(code, f"{sh_path.name}#snippet{idx}", "exec")
+                checked += 1
+        self.assertGreaterEqual(checked, 8, "Expected inline python3 -c snippets in shell scripts")
+
+    @unittest.skipIf(os.name == "nt", "POSIX shell test — run inside Docker container on Windows")
+    def test_vpn_watchdog_auto_failover_switches_dead_pinned_node_to_auto_proxy(self):
+        with tempfile.TemporaryDirectory() as td:
+            bin_dir = Path(td) / "bin"
+            run_dir = Path(td) / "run"
+            (run_dir / "vpn").mkdir(parents=True)
+            bin_dir.mkdir()
+            (run_dir / "vpn" / "mode").write_text("strict\n", encoding="utf-8")
+            (run_dir / "vpn" / "state").write_text("UP\n", encoding="utf-8")
+
+            ctl_log = Path(td) / "ctl.log"
+            payload_file = Path(td) / "status.json"
+            # Simulates exact live failure: pinned dead VLESS node while 6 Hysteria2 nodes work in auto-proxy
+            payload_file.write_text(
+                '{"mode":"strict","state":"UP","tun_up":true,"singbox_running":true,'
+                '"selector_now":"Belgium-Dead","auto_proxy_now":"Switzerland-HY2",'
+                '"active_node":"Belgium-Dead","reachable_nodes":6,"total_nodes":30,'
+                '"egress":{"ok":false,"error":"reality verification failed"}}',
+                encoding="utf-8",
+            )
+            self._make_exec(bin_dir / "ip", "#!/bin/sh\nexit 0\n")
+            self._make_exec(bin_dir / "curl", f'#!/bin/sh\ncat "{payload_file}"\n')
+            fake_ctl = self._make_exec(
+                bin_dir / "vpn-ctl",
+                f'#!/bin/sh\necho "$*" >> "{ctl_log}"\nexit 0\n',
+            )
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env['PATH']}",
+                    "DEV_INFRA_RUN_DIR": str(run_dir),
+                    "VPN_CTL_BIN": str(fake_ctl),
+                    "VPN_GUI_NOTIFICATIONS": "0",
+                    "VPN_AUTO_FAILOVER": "1",
+                    "VPN_L7_CHECK_EVERY": "1",
+                    "VPN_FAIL_THRESHOLD": "1",
+                    "VPN_WATCHDOG_ONCE": "1",
+                }
+            )
+            res = subprocess.run(
+                ["bash", str(ROOT / "container/vpn-watchdog.sh")],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertEqual((run_dir / "vpn" / "state").read_text().strip(), "DEGRADED_NO_EGRESS")
+            self.assertIn("select auto-proxy", ctl_log.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()
+
+

@@ -13,6 +13,7 @@ class TestDocsParity(unittest.TestCase):
             "/etc/sing-box/start-claude.sh",
             "ubuntu24-dev-box",
             "README-my.md",
+            '--entrypoint ""',
         ]:
             self.assertNotIn(stale, readme, f"Stale reference '{stale}' found in README.md")
 
@@ -53,6 +54,7 @@ class TestDocsParity(unittest.TestCase):
             "CHROMIUM_START_URL",
             "BIND_HOST",
             "COMPOSE_PROJECT_NAME",
+            "DEV_INFRA_PROFILE",
             "WORKSPACE_DIR",
             "CODE_SERVER_PORT",
             "NOVNC_PORT",

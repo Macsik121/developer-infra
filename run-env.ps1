@@ -4,6 +4,8 @@
 
 .EXAMPLE
     .\run-env.ps1
+    .\run-env.ps1 -Profile lite -AutoPort
+    .\run-env.ps1 -Profile full -AutoPort
     .\run-env.ps1 -CheckPorts
     .\run-env.ps1 -AutoPort -NoBuild
     .\run-env.ps1 -Mode headless
@@ -14,6 +16,9 @@
 param(
     [ValidateSet("wslg", "headless")]
     [string]$Mode = "wslg",
+
+    [ValidateSet("", "lite", "full")]
+    [string]$Profile = "",
 
     [string]$EnvFile = ".env",
     [switch]$Detach,
@@ -32,13 +37,14 @@ if ($Help) {
 Usage: .\run-env.ps1 [OPTIONS]
 
 Options:
-  -Mode <wslg|headless>  Display mode (default: wslg for Docker Desktop WSL2; use headless for Hyper-V)
-  -EnvFile <path>        Path to .env file (default: .env)
-  -CheckPorts            Inspect host port availability / owners & host VPN status, then exit
-  -AutoPort              Automatically increment (+1) conflicting host ports until free
-  -Detach                Start container without attaching an interactive shell
-  -NoBuild               Skip --build on docker compose up
-  -Help, -h              Show this help
+  -Mode <wslg|headless>    Display mode (default: wslg for Docker Desktop WSL2; use headless for Hyper-V)
+  -Profile <lite|full>     Build target: 'lite' (fast VPN + Chromium check) or 'full' (IDE + AI stack; default from .env or full)
+  -EnvFile <path>          Path to .env file (default: .env)
+  -CheckPorts              Inspect host port availability / owners & host VPN status, then exit
+  -AutoPort                Automatically increment (+1) conflicting host ports until free
+  -Detach                  Start container without attaching an interactive shell
+  -NoBuild                 Skip --build on docker compose up
+  -Help, -h                Show this help
 "@
     exit 0
 }
@@ -109,6 +115,15 @@ if ($envMap["NOVNC_PORT"]) { $novncPort = [int]$envMap["NOVNC_PORT"] }
 $omniPort = 20128
 if ($envMap["OMNIROUTE_PORT"]) { $omniPort = [int]$envMap["OMNIROUTE_PORT"] }
 $workspaceDir = if ($envMap["WORKSPACE_DIR"]) { $envMap["WORKSPACE_DIR"] } else { "./workspace" }
+$buildProfile = $Profile
+if ([string]::IsNullOrWhiteSpace($buildProfile)) {
+    if ($envMap["DEV_INFRA_PROFILE"]) { $buildProfile = $envMap["DEV_INFRA_PROFILE"].ToLowerInvariant() }
+    else { $buildProfile = "full" }
+}
+if ($buildProfile -notin @("lite", "full")) {
+    Write-Error "Invalid DEV_INFRA_PROFILE '$buildProfile'. Expected 'lite' or 'full'."
+    exit 1
+}
 
 # 3. Host VPN / TUN detection (non-blocking advisory)
 try {
@@ -288,19 +303,31 @@ if (-not $NoBuild) {
     $upArgs += "--build"
 }
 
-Write-Host "[run-env] Starting developer-infra (mode=$Mode, env=$EnvFile)..." -ForegroundColor Cyan
+[Environment]::SetEnvironmentVariable("DEV_INFRA_PROFILE", $buildProfile, "Process")
+[Environment]::SetEnvironmentVariable("DOCKER_BUILDKIT", "1", "Process")
+[Environment]::SetEnvironmentVariable("COMPOSE_DOCKER_CLI_BUILD", "1", "Process")
+
+Write-Host "[run-env] Starting developer-infra (mode=$Mode, profile=$buildProfile, env=$EnvFile)..." -ForegroundColor Cyan
 & docker @composeArgs @upArgs
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
 Write-Host ""
-Write-Host "Ready:" -ForegroundColor Green
-Write-Host "  code-server : http://${bindHost}:${codePort}"
-Write-Host "  noVNC       : http://${bindHost}:${novncPort}/vnc.html"
-Write-Host "  OmniRoute   : http://${bindHost}:${omniPort}"
-Write-Host "  VPN status  : .\vpn-ctl.ps1 status  (in Chromium: http://127.0.0.1:9099)"
-Write-Host "  Claude Code : .\start-claude.ps1"
+if ($buildProfile -eq "lite") {
+    Write-Host "Ready (profile=lite: VPN + Chromium verification build):" -ForegroundColor Green
+    Write-Host "  noVNC       : http://${bindHost}:${novncPort}/vnc.html"
+    Write-Host "  VPN status  : .\vpn-ctl.ps1 status  (in Chromium: http://127.0.0.1:9099)"
+    Write-Host "  Diagnostics : .\diag-env.ps1"
+    Write-Host "  Upgrade full: .\run-env.ps1 -Profile full -AutoPort"
+} else {
+    Write-Host "Ready (profile=full):" -ForegroundColor Green
+    Write-Host "  code-server : http://${bindHost}:${codePort}"
+    Write-Host "  noVNC       : http://${bindHost}:${novncPort}/vnc.html"
+    Write-Host "  OmniRoute   : http://${bindHost}:${omniPort}"
+    Write-Host "  VPN status  : .\vpn-ctl.ps1 status  (in Chromium: http://127.0.0.1:9099)"
+    Write-Host "  Claude Code : .\start-claude.ps1"
+}
 Write-Host ""
 
 if (-not $Detach) {

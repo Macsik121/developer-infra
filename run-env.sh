@@ -10,6 +10,7 @@ set -euo pipefail
 
 ENV_FILE=".env"
 MODE="headless"
+PROFILE=""
 DETACH=0
 NO_BUILD=0
 CHECK_PORTS=0
@@ -21,6 +22,7 @@ Usage: ./run-env.sh [OPTIONS]
 
 Options:
   --mode <headless|wslg>   Compose display profile (default: headless)
+  --profile <lite|full>    Build target: 'lite' (fast VPN + Chromium check) or 'full' (IDE + AI stack; default from .env or full)
   --env-file <path>        Path to .env file (default: .env)
   --check-ports            Inspect host port availability / owners & host VPN status, then exit
   --auto-port              Automatically increment (+1) conflicting host ports until free
@@ -33,6 +35,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode)        MODE="${2:-}"; shift 2 ;;
+        --profile)     PROFILE="${2:-}"; shift 2 ;;
         --env-file)    ENV_FILE="${2:-}"; shift 2 ;;
         --check-ports) CHECK_PORTS=1; shift ;;
         --auto-port)   AUTO_PORT=1; shift ;;
@@ -94,6 +97,15 @@ CODE_PORT="$(get_env_val CODE_SERVER_PORT)"; CODE_PORT="${CODE_PORT:-8080}"
 NOVNC_PORT="$(get_env_val NOVNC_PORT)"; NOVNC_PORT="${NOVNC_PORT:-6901}"
 OMNI_PORT="$(get_env_val OMNIROUTE_PORT)"; OMNI_PORT="${OMNI_PORT:-20128}"
 WORKSPACE_DIR="$(get_env_val WORKSPACE_DIR)"; WORKSPACE_DIR="${WORKSPACE_DIR:-./workspace}"
+if [[ -z "$PROFILE" ]]; then
+    PROFILE="$(get_env_val DEV_INFRA_PROFILE)"
+    PROFILE="${PROFILE:-full}"
+fi
+PROFILE="${PROFILE,,}"
+case "$PROFILE" in
+    lite|full) ;;
+    *) echo "ERROR: --profile / DEV_INFRA_PROFILE must be 'lite' or 'full'." >&2; exit 1 ;;
+esac
 
 # 3. Host VPN / TUN detection (non-blocking advisory)
 if command -v ip >/dev/null 2>&1; then
@@ -229,16 +241,28 @@ fi
 UP_ARGS=(up -d)
 [[ "$NO_BUILD" -eq 0 ]] && UP_ARGS+=(--build)
 
-echo "[run-env] Starting developer-infra (mode=${MODE}, env=${ENV_FILE})..."
+export DEV_INFRA_PROFILE="$PROFILE"
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+
+echo "[run-env] Starting developer-infra (mode=${MODE}, profile=${PROFILE}, env=${ENV_FILE})..."
 docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" "${UP_ARGS[@]}"
 
 echo ""
-echo "Ready:"
-echo "  code-server : http://${BIND_HOST}:${CODE_PORT}"
-echo "  noVNC       : http://${BIND_HOST}:${NOVNC_PORT}/vnc.html"
-echo "  OmniRoute   : http://${BIND_HOST}:${OMNI_PORT}"
-echo "  VPN status  : ./vpn-ctl.sh status  (in Chromium: http://127.0.0.1:9099)"
-echo "  Claude Code : docker compose --env-file ${ENV_FILE} exec -it -u coder ubuntu-dev start-claude"
+if [[ "$PROFILE" == "lite" ]]; then
+    echo "Ready (profile=lite: VPN + Chromium verification build):"
+    echo "  noVNC       : http://${BIND_HOST}:${NOVNC_PORT}/vnc.html"
+    echo "  VPN status  : ./vpn-ctl.sh status  (in Chromium: http://127.0.0.1:9099)"
+    echo "  Diagnostics : ./diag-env.sh"
+    echo "  Upgrade full: ./run-env.sh --profile full --auto-port"
+else
+    echo "Ready (profile=full):"
+    echo "  code-server : http://${BIND_HOST}:${CODE_PORT}"
+    echo "  noVNC       : http://${BIND_HOST}:${NOVNC_PORT}/vnc.html"
+    echo "  OmniRoute   : http://${BIND_HOST}:${OMNI_PORT}"
+    echo "  VPN status  : ./vpn-ctl.sh status  (in Chromium: http://127.0.0.1:9099)"
+    echo "  Claude Code : docker compose --env-file ${ENV_FILE} exec -it -u coder ubuntu-dev start-claude"
+fi
 echo ""
 
 if [[ "$DETACH" -eq 0 ]]; then

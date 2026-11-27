@@ -49,7 +49,8 @@ ARGS=(
     --no-first-run
     --no-default-browser-check
     --password-store=basic
-    --disable-features=dbus
+    --disable-features=dbus,DnsOverHttps
+    --force-webrtc-ip-handling-policy=disable_non_proxied_udp
     --ozone-platform=x11
     "--user-data-dir=${PROFILE_DIR}"
     --window-position=0,0
@@ -60,6 +61,10 @@ ARGS=(
     --disable-frame-rate-limit
     --disable-gpu-vsync
 )
+
+if [[ "${CHROMIUM_DISABLE_QUIC:-1}" == "1" ]]; then
+    ARGS+=(--disable-quic)
+fi
 
 if [[ "${CHROMIUM_DISABLE_GPU:-0}" == "1" ]]; then
     ARGS+=(--disable-gpu)

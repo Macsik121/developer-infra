@@ -175,6 +175,48 @@ class TestComposeAndCli(unittest.TestCase):
         self.assertNotIn("${SCRIPT_DIR}/claude_models.json", sc_sh)
         self.assertIn("VPN_STATE_FILE", sc_sh)
 
+    def test_multistage_lite_and_full_profiles_invariants(self):
+        df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+        self.assertTrue(df.startswith("# syntax=docker/dockerfile:1"), "Dockerfile must declare BuildKit syntax header")
+        for stage in ["AS base-net", "FROM base-net AS lite", "FROM base-net AS full-deps", "FROM full-deps AS full"]:
+            self.assertIn(stage, df, f"Missing multi-stage target '{stage}' in Dockerfile")
+        self.assertIn("ENV DEV_INFRA_PROFILE=lite", df)
+        self.assertIn("ENV DEV_INFRA_PROFILE=full", df)
+        self.assertIn("--mount=type=cache,target=/var/cache/apt", df)
+        self.assertIn("--mount=type=cache,target=/root/.npm", df)
+        # Ensure heavy full-deps (nodejs/code-server/claude-code/omniroute) live strictly AFTER base-net/lite
+        idx_lite_end = df.index("FROM base-net AS full-deps")
+        base_and_lite = df[:idx_lite_end]
+        for heavy in ["nodesource", "code-server.dev/install.sh", "@anthropic-ai/claude-code", "omniroute@"]:
+            self.assertNotIn(heavy, base_and_lite, f"Heavy tool '{heavy}' leaked into base-net/lite stage")
+
+        compose = (ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
+        self.assertIn("target: ${DEV_INFRA_PROFILE:-full}", compose)
+        self.assertIn("dev.infra.profile=${DEV_INFRA_PROFILE:-full}", compose)
+
+        sup = (ROOT / "supervisord.conf").read_text(encoding="utf-8")
+        self.assertIn("if ! command -v code-server", sup)
+        self.assertIn("if ! command -v omniroute", sup)
+        self.assertGreaterEqual(sup.count("startsecs=0"), 7)
+
+        re_ps1 = (ROOT / "run-env.ps1").read_text(encoding="utf-8")
+        self.assertIn('[ValidateSet("", "lite", "full")]', re_ps1)
+        self.assertIn("DEV_INFRA_PROFILE", re_ps1)
+        self.assertIn("DOCKER_BUILDKIT", re_ps1)
+
+        re_sh = (ROOT / "run-env.sh").read_text(encoding="utf-8")
+        self.assertIn("--profile)", re_sh)
+        self.assertIn("export DEV_INFRA_PROFILE=", re_sh)
+        self.assertIn("export DOCKER_BUILDKIT=1", re_sh)
+
+        diag_ps1 = (ROOT / "diag-env.ps1").read_text(encoding="utf-8")
+        self.assertIn("DEV_INFRA_PROFILE", diag_ps1)
+        self.assertIn("SKIP(lite)", diag_ps1)
+
+        diag_sh = (ROOT / "diag-env.sh").read_text(encoding="utf-8")
+        self.assertIn("DEV_INFRA_PROFILE", diag_sh)
+        self.assertIn("SKIP(lite)", diag_sh)
+
 
 if __name__ == "__main__":
     unittest.main()

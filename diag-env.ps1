@@ -220,7 +220,10 @@ if ([string]::IsNullOrWhiteSpace($containerId)) {
 $containerId = $containerId.Trim()
 $shortId = $containerId
 if ($shortId.Length -gt 12) { $shortId = $shortId.Substring(0, 12) }
-Record-Check "PASS" "Container ubuntu-dev" "running (id=$shortId)"
+$profRes = Invoke-DockerClean @("exec", "-u", "coder", $containerId, "printenv", "DEV_INFRA_PROFILE")
+$containerProfile = $profRes.Stdout.Trim().ToLowerInvariant()
+if ($containerProfile -notin @("lite", "full")) { $containerProfile = "full" }
+Record-Check "PASS" "Container ubuntu-dev" "running (id=$shortId, profile=$containerProfile)"
 
 Write-Step "[1/4.2] Running supervisorctl status..."
 $supRes = Invoke-DockerClean @("exec", "-u", "root", $containerId, "supervisorctl", "status")
@@ -231,14 +234,18 @@ $dispRes = Invoke-DockerClean @("exec", "-u", "coder", $containerId, "/usr/local
 $activeDisp = $dispRes.Stdout.Trim()
 if ([string]::IsNullOrWhiteSpace($activeDisp)) { $activeDisp = "unknown" }
 $locRes = Invoke-DockerClean @("exec", "-u", "coder", $containerId, "locale")
-Append-Section $svcFile "Active DISPLAY & Locale" ("DISPLAY=$activeDisp" + [Environment]::NewLine + $locRes.Combined)
+Append-Section $svcFile "Active DISPLAY & Locale" ("PROFILE=$containerProfile" + [Environment]::NewLine + "DISPLAY=$activeDisp" + [Environment]::NewLine + $locRes.Combined)
 
 $fatalSvcs = @()
 $coreDown = @()
 foreach ($ln in ($supRes.Stdout -split "`r?`n")) {
     if ($ln -match "^(\S+)\s+FATAL") { $fatalSvcs += $Matches[1] }
 }
-foreach ($core in @("vpn-sub-updater", "sing-box", "vpn-watchdog", "code-server", "omniroute")) {
+$requiredCore = @("vpn-sub-updater", "sing-box", "vpn-watchdog", "code-server", "omniroute")
+if ($containerProfile -eq "lite") {
+    $requiredCore = @("vpn-sub-updater", "sing-box", "vpn-watchdog")
+}
+foreach ($core in $requiredCore) {
     if ($supRes.Stdout -notmatch ("(?m)^" + [regex]::Escape($core) + "\s+RUNNING")) {
         $coreDown += $core
     }
@@ -247,7 +254,7 @@ if ($supRes.Stdout -notmatch "(?m)^vpn-status\s+RUNNING") {
     $coreDown += "vpn-status (v2.1+ image needed)"
 }
 if ($coreDown.Count -eq 0 -and $fatalSvcs.Count -eq 0) {
-    Record-Check "PASS" "supervisord services" "All core services RUNNING (DISPLAY=$activeDisp)"
+    Record-Check "PASS" "supervisord services" "All core services RUNNING (profile=$containerProfile, DISPLAY=$activeDisp)"
 } elseif ($coreDown.Count -gt 0) {
     Record-Check "FAIL" "supervisord core services" ("Not RUNNING: " + ($coreDown -join ", "))
     if ($coreDown -contains "vpn-status (v2.1+ image needed)") {
@@ -378,16 +385,28 @@ if ($l7ProxyOk) {
 Write-Step "[2/4.6] Checking local loopback services (8080 / 9099 / $omniPort)..."
 $localCmd = @"
 printf 'code-server(8080): '
-curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && echo OK || echo FAIL
+if command -v code-server >/dev/null 2>&1; then
+  curl -fsS --max-time 2 http://127.0.0.1:8080/healthz >/dev/null 2>&1 && echo OK || echo FAIL
+else
+  echo 'SKIP(lite)'
+fi
 printf 'vpn-status(9099): '
 (curl -fsS --max-time 2 http://127.0.0.1:9099/healthz >/dev/null 2>&1 || curl -fsS --max-time 6 'http://127.0.0.1:9099/api/status?fast=1' >/dev/null 2>&1) && echo OK || echo FAIL
 printf 'omniroute($omniPort): '
-curl -fsS --max-time 2 http://127.0.0.1:$omniPort >/dev/null 2>&1 && echo OK || echo FAIL
+if command -v omniroute >/dev/null 2>&1; then
+  curl -fsS --max-time 2 http://127.0.0.1:$omniPort >/dev/null 2>&1 && echo OK || echo FAIL
+else
+  echo 'SKIP(lite)'
+fi
 "@
 $localRes = Invoke-DockerClean @("exec", "-i", "-u", "coder", $containerId, "bash", "-s") $localCmd
 Append-Section $netFile "Internal Loopback Services" $localRes.Combined
 $localStatus = "FAIL"
-if ($localRes.Stdout -match "code-server\(8080\):\s*OK") { $localStatus = "PASS" }
+if ($containerProfile -eq "lite") {
+    if ($localRes.Stdout -match "vpn-status\(9099\):\s*OK") { $localStatus = "PASS" }
+} else {
+    if ($localRes.Stdout -match "code-server\(8080\):\s*OK") { $localStatus = "PASS" }
+}
 Record-Check $localStatus "Local services (8080/9099/$omniPort)" ($localRes.Stdout.Trim() -replace "\r?\n", " | ")
 
 # ------------------------------------------------------------------
@@ -413,7 +432,7 @@ if (-not $SkipRetest) {
 
 Write-Step "[3/4.4] Inspecting config.active.json & probing 5 TCP nodes directly with SO_MARK=255..."
 $inspectPy = @'
-import json, socket, time
+import ipaddress, json, socket, time
 from pathlib import Path
 
 cfg_path = Path("/var/lib/sing-box/config.active.json")
@@ -442,9 +461,25 @@ print("FIRST_10_NODES:")
 for i, p in enumerate(proxies[:10], 1):
     print(f"  {i:2d}. [{p.get('type')}] {p.get('tag')} -> {p.get('server')}:{p.get('server_port')}")
 
+reality_nodes = [p for p in proxies if p.get("type") == "vless" and (p.get("tls") or {}).get("reality", {}).get("enabled")]
+if reality_nodes:
+    print("\nVLESS_REALITY_META (redacted, first 3 nodes):")
+    for p in reality_nodes[:3]:
+        tls = p.get("tls") or {}
+        rel = tls.get("reality") or {}
+        utls = tls.get("utls") or {}
+        pbk = str(rel.get("public_key") or "")
+        sid = str(rel.get("short_id") or "")
+        print(
+            f"  - {p.get('tag')}: sni={tls.get('server_name')}, fp={utls.get('fingerprint')}, "
+            f"utls={bool(utls.get('enabled'))}, flow={p.get('flow') or 'none'}, "
+            f"pbk_len={len(pbk)}, pbk_has_space={' ' in pbk}, sid_len={len(sid)}"
+        )
+
 print("\nDIRECT_TCP_PROBE_WITH_SO_MARK_255 (first 5 TCP nodes):")
 tcp_nodes = [p for p in proxies if p.get("type") != "hysteria2"][:5]
 ok_cnt = 0
+pub_rtts = []
 for p in tcp_nodes:
     host, port = p.get("server"), int(p.get("server_port", 443))
     t0 = time.monotonic()
@@ -458,12 +493,20 @@ for p in tcp_nodes:
         s.connect((host, port))
         ms = int((time.monotonic() - t0) * 1000)
         ok_cnt += 1
+        try:
+            ip_obj = ipaddress.ip_address(host)
+            if not ip_obj.is_private:
+                pub_rtts.append(ms)
+        except ValueError:
+            pass
         print(f"  [OK]   {p.get('tag')} ({host}:{port}) {ms} ms")
     except Exception as e:
         print(f"  [FAIL] {p.get('tag')} ({host}:{port}) -> {e}")
     finally:
         s.close()
 print(f"DIRECT_TCP_OK={ok_cnt}/{len(tcp_nodes)}")
+if pub_rtts and all(r <= 8 for r in pub_rtts):
+    print("LOCAL_SYN_ACK_SUSPECT=1")
 '@
 
 $cfgAudit = Invoke-DockerClean @("exec", "-i", "-u", "root", $containerId, "python3", "-") $inspectPy
@@ -486,13 +529,27 @@ if ($cfgAudit.Stdout -match "TUN_MTU=1400") {
     Record-Check "FAIL" "Active sing-box config" "config.active.json missing or unreadable"
 }
 
+$selMatch = [regex]::Match($vpnSelect.Stdout, "(?m)^Active Selector\s*:\s*(.+)$")
+$autoResMatch = [regex]::Match($vpnSelect.Stdout, "\[resolved:\s*([^\]]+)\]")
+$pinnedNonAuto = ($selMatch.Success -and ($selMatch.Groups[1].Value.Trim() -notmatch "^auto-proxy") -and ($selMatch.Groups[1].Value.Trim() -ne "direct"))
+$localSynAckSuspect = ($cfgAudit.Stdout -match "LOCAL_SYN_ACK_SUSPECT=1")
+
 if (-not $l7TunOk) {
+    if ($pinnedNonAuto) {
+        $pinnedName = $selMatch.Groups[1].Value.Trim()
+        $autoHint = ""
+        if ($autoResMatch.Success) { $autoHint = " (auto-proxy already resolved: " + $autoResMatch.Groups[1].Value.Trim() + ")" }
+        [void]$hints.Add(("Active selector is pinned to failing manual node '" + $pinnedName + "'" + $autoHint + ". Run .\vpn-ctl.ps1 select auto-proxy (v2.2.3 watchdog auto-recovers this)."))
+    }
     if ($l7ProxyOk) {
         [void]$hints.Add("Internal proxy 127.0.0.1:2080 WORKS while TUN failed -> TUN routing/MTU conflict with host VPN. Try .\vpn-ctl.ps1 proxy + open-chromium --proxy.")
     } elseif ($directTcpTotal -gt 0 -and $directTcpOk -eq 0) {
         [void]$hints.Add("Direct TCP (SO_MARK=255) failed to ALL $directTcpTotal tested nodes! Current nodes are blocked/unreachable from your host IP/VPN. Run .\vpn-ctl.ps1 update (v2.2 auto-recovers via bootstrap-allow + fwmark) or disable Host VPN TUN mode.")
     } elseif ($directTcpOk -gt 0) {
         [void]$hints.Add("Direct TCP to VPN servers works ($directTcpOk/$directTcpTotal), so upstream is reachable, but TLS/VLESS handshake or routing inside sing-box failed. Inspect 04-logs-*.log (sing-box.err.log) & 03-vpn-audit.txt.")
+    }
+    if ($localSynAckSuspect) {
+        [void]$hints.Add("Direct TCP probes returned <=8ms to public IPs (typical of host VPN gVisor TUN local SYN-ACK) - raw TCP connect cannot prove VLESS Reality handshakes succeed.")
     }
 }
 
@@ -513,6 +570,12 @@ if (Test-Path -LiteralPath $collectScript) {
     }
     & $collectScript @collectParams
     Record-Check "PASS" "Supervisor logs collected" "Saved to $logFileName"
+    if (-not $l7TunOk -and (Test-Path -LiteralPath $logsFile)) {
+        $logsText = [System.IO.File]::ReadAllText($logsFile)
+        if ($logsText -match "reality verification failed") {
+            [void]$hints.Add("Detected 'reality verification failed' in sing-box.err.log: VLESS Reality handshake rejected by server or intercepted by host VPN/DPI. Switch to auto-proxy (Hysteria2 fallback) or run .\vpn-ctl.ps1 update.")
+        }
+    }
 } else {
     Record-Check "WARN" "Supervisor logs collected" "collect-logs.ps1 not found next to diag-env.ps1"
 }
@@ -525,6 +588,7 @@ $sumLines = New-Object System.Collections.ArrayList
 [void]$sumLines.Add("developer-infra System Diagnostic Summary")
 [void]$sumLines.Add("Timestamp : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
 [void]$sumLines.Add("EnvFile   : $EnvFile")
+[void]$sumLines.Add("Profile   : $containerProfile")
 [void]$sumLines.Add("========================================================================")
 [void]$sumLines.Add("")
 [void]$sumLines.Add("Check Results:")
