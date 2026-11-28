@@ -246,6 +246,17 @@ export DEV_INFRA_PROFILE="$PROFILE"
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
+# 5. Host DNS preflight (catches broken [::1]:53 / empty resolv.conf on fresh Linux VMs before docker fails)
+if [[ "$NO_BUILD" -eq 0 ]] && command -v getent >/dev/null 2>&1; then
+    REG_HOST="${IMAGE_REPO%%/*}"
+    if ! getent ahosts "$REG_HOST" >/dev/null 2>&1 && ! getent ahosts "public.ecr.aws" >/dev/null 2>&1; then
+        echo "[run-env] WARNING: Host DNS failed to resolve '${REG_HOST}' and 'public.ecr.aws'!" >&2
+        echo "          On Ubuntu VMs (e.g. osboxes), 'lookup ... on [::1]:53: connection refused' means host DNS is broken." >&2
+        echo "          Quick fix: add '\"dns\": [\"1.1.1.1\", \"8.8.8.8\"]' to /etc/docker/daemon.json & run 'sudo systemctl restart docker'," >&2
+        echo "          and check /etc/resolv.conf (or set BASE_IMAGE / APT_MIRROR in ${ENV_FILE})." >&2
+    fi
+fi
+
 if [[ "$LOCAL_BUILD" -eq 1 ]]; then
     echo "[run-env] Local build requested: building and starting developer-infra (mode=${MODE}, profile=${PROFILE}, env=${ENV_FILE})..."
     docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" up -d --build

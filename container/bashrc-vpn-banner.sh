@@ -15,10 +15,10 @@ __dev_infra_vpn_banner() {
             return 0
             ;;
         DEGRADED_NO_EGRESS)
-            printf '\033[1;31m[VPN DEGRADED: NO EGRESS | mode=%s]\033[0m sing-tun is up, but proxy nodes are timing out. Run: vpn-ctl status | retest\n' "$mode"
+            printf '\033[1;31m[VPN DEGRADED: NO EGRESS | mode=%s]\033[0m sing-tun is up, but proxy nodes are timing out. Run: vpn-ctl status  (or: vpn-ctl retest)\n' "$mode"
             ;;
         DOWN_STRICT)
-            printf '\033[1;31m[VPN KILL-SWITCH ACTIVE | mode=%s]\033[0m Traffic blocked while sing-box is down. Run on host: vpn-ctl status | direct\n' "$mode"
+            printf '\033[1;31m[VPN KILL-SWITCH ACTIVE | mode=%s]\033[0m Traffic blocked while sing-box is down. Run on host: vpn-ctl status  (or: vpn-ctl direct)\n' "$mode"
             ;;
         DOWN_FALLBACK)
             printf '\033[1;33m[VPN DEGRADED | mode=fallback]\033[0m Direct egress active (unprotected). Check: vpn-ctl status\n'

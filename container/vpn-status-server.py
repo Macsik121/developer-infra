@@ -30,8 +30,25 @@ TUN_IFACE = os.environ.get("VPN_TUN_IFACE", "sing-tun")
 SUPERVISOR_LOG_DIR = os.environ.get("DEV_INFRA_SUPERVISOR_LOG_DIR", "/var/log/supervisor")
 
 _EGRESS_LOCK = threading.Lock()
-_EGRESS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+_EGRESS_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "geoip_ts": 0.0,
+    "node": "",
+    "data": None,
+}
 EGRESS_CACHE_TTL = 15.0
+GEOIP_CACHE_TTL = 180.0
+
+GEOIP_PROVIDERS: Tuple[Tuple[str, str, str], ...] = (
+    ("api.ip.sb", "https://api.ip.sb/geoip", "json"),
+    ("ipwho.is", "https://ipwho.is/", "json"),
+    ("ipinfo.io", "https://ipinfo.io/json", "json"),
+    ("ifconfig.me", "https://ifconfig.me/ip", "text"),
+)
+CONNECTIVITY_204_URLS: Tuple[str, ...] = (
+    "https://www.gstatic.com/generate_204",
+    "https://cp.cloudflare.com/generate_204",
+)
 
 
 def read_text(path: str, default: str = "") -> str:
@@ -78,18 +95,6 @@ def resolve_active_node(proxies: Dict[str, Any]) -> Tuple[str, str, Optional[int
     """Return (selector_now, resolved_leaf_node, delay_ms, reachable_count, total_nodes)."""
     selector = proxies.get("proxy-select", {})
     sel_now = selector.get("now") or "n/a"
-    leaf = sel_now
-    if sel_now == "auto-proxy":
-        auto = proxies.get("auto-proxy", {})
-        leaf = auto.get("now") or "auto-proxy (selecting...)"
-
-    leaf_obj = proxies.get(leaf, {})
-    delay_ms: Optional[int] = None
-    history = leaf_obj.get("history") or []
-    if isinstance(history, list) and history:
-        last_d = history[-1].get("delay")
-        if isinstance(last_d, (int, float)) and last_d > 0:
-            delay_ms = int(last_d)
 
     all_nodes = [
         name for name in (proxies.get("auto-proxy", {}).get("all") or [])
@@ -101,16 +106,53 @@ def resolve_active_node(proxies: Dict[str, Any]) -> Tuple[str, str, Optional[int
         if hist and isinstance(hist[-1].get("delay"), (int, float)) and hist[-1]["delay"] > 0:
             reachable += 1
 
+    leaf = sel_now
+    if sel_now == "auto-proxy":
+        auto = proxies.get("auto-proxy", {})
+        leaf = auto.get("now") or (
+            f"selecting ({reachable}/{len(all_nodes)} ready)" if all_nodes else "selecting..."
+        )
+
+    leaf_obj = proxies.get(leaf, {})
+    delay_ms: Optional[int] = None
+    history = leaf_obj.get("history") or []
+    if isinstance(history, list) and history:
+        last_d = history[-1].get("delay")
+        if isinstance(last_d, (int, float)) and last_d > 0:
+            delay_ms = int(last_d)
+
     return sel_now, leaf, delay_ms, reachable, len(all_nodes)
 
 
-def _probe_egress_once() -> Dict[str, Any]:
-    """
-    Bounded L7 HTTPS egress probe.
-    Prefers `curl -4 --max-time 3` because Python's urllib/glibc getaddrinfo() ignores
-    socket timeouts during DNS retries (blocking 5-10s when TUN DNS is broken).
-    """
-    result: Dict[str, Any] = {"ok": False, "ip": "", "country": "", "org": "", "error": ""}
+def _parse_geoip_payload(provider: str, kind: str, body: str) -> Optional[Dict[str, str]]:
+    text = body.strip()
+    if not text:
+        return None
+    if kind == "text":
+        ip_line = text.splitlines()[0].strip()
+        if ip_line and len(ip_line) <= 64 and " " not in ip_line and "<" not in ip_line:
+            return {"ip": ip_line, "country": "", "org": "", "source": provider}
+        return None
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("success") is False:
+        return None
+    ip = str(payload.get("ip") or "").strip()
+    if not ip:
+        return None
+    country = str(payload.get("country_code") or payload.get("country") or "").strip()
+    org = str(payload.get("organization") or payload.get("org") or "").strip()
+    if not org and isinstance(payload.get("connection"), dict):
+        conn = payload["connection"]
+        org = str(conn.get("org") or conn.get("isp") or "").strip()
+    if not org and payload.get("isp"):
+        org = str(payload.get("isp") or "").strip()
+    return {"ip": ip, "country": country, "org": org, "source": provider}
+
+
+def _http_get_text(url: str, timeout: float = 3.0) -> Tuple[bool, str, str]:
+    """Bounded IPv4 HTTPS GET using curl (avoids glibc getaddrinfo blocking)."""
     curl_bin = shutil.which("curl")
     if curl_bin:
         try:
@@ -120,70 +162,180 @@ def _probe_egress_once() -> Dict[str, Any]:
                     "-4",
                     "-fsS",
                     "--max-time",
-                    "3",
+                    str(int(timeout)),
                     "-H",
                     "User-Agent: developer-infra-status/2.2",
                     "-H",
-                    "Accept: application/json",
-                    "https://ipinfo.io/json",
+                    "Accept: application/json, text/plain",
+                    url,
                 ],
                 capture_output=True,
                 text=True,
-                timeout=3.5,
+                timeout=timeout + 0.8,
             )
-            if proc.returncode == 0 and proc.stdout.strip():
-                payload = json.loads(proc.stdout)
-                if isinstance(payload, dict) and payload.get("ip"):
-                    result["ok"] = True
-                    result["ip"] = str(payload.get("ip", ""))
-                    result["country"] = str(payload.get("country", ""))
-                    result["org"] = str(payload.get("org", ""))
-                    return result
+            if proc.returncode == 0:
+                return True, proc.stdout, ""
             err_msg = (proc.stderr or proc.stdout or f"curl exit {proc.returncode}").strip()
-            result["error"] = err_msg.splitlines()[-1][:180] if err_msg else f"curl exit {proc.returncode}"
-            return result
+            return False, "", err_msg.splitlines()[-1][:180] if err_msg else f"curl exit {proc.returncode}"
         except subprocess.TimeoutExpired:
-            result["error"] = "egress/DNS probe timed out (>3.5s)"
-            return result
+            return False, "", f"egress/DNS probe timed out (>{timeout:.1f}s)"
         except Exception as exc:
-            result["error"] = str(exc)[:180]
-            return result
+            return False, "", str(exc)[:180]
 
     try:
         req = urllib.request.Request(
-            "https://ipinfo.io/json",
-            headers={"User-Agent": "developer-infra-status/2.2", "Accept": "application/json"},
+            url,
+            headers={"User-Agent": "developer-infra-status/2.2", "Accept": "application/json, text/plain"},
         )
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
-            result["ok"] = True
-            result["ip"] = str(payload.get("ip", ""))
-            result["country"] = str(payload.get("country", ""))
-            result["org"] = str(payload.get("org", ""))
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, resp.read().decode("utf-8", errors="ignore"), ""
     except Exception as exc:
-        result["error"] = str(exc)[:180]
+        return False, "", str(exc)[:180]
+
+
+def _probe_http_204(timeout: float = 3.0) -> Tuple[bool, str]:
+    """Zero-rate-limit HTTPS connectivity verification (HTTP 204/200)."""
+    curl_bin = shutil.which("curl")
+    last_err = "no connectivity"
+    for url in CONNECTIVITY_204_URLS:
+        if curl_bin:
+            try:
+                proc = subprocess.run(
+                    [
+                        curl_bin,
+                        "-4",
+                        "-sS",
+                        "--max-time",
+                        str(int(timeout)),
+                        "-o",
+                        "/dev/null",
+                        "-w",
+                        "%{http_code}",
+                        url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout + 0.8,
+                )
+                code = (proc.stdout or "").strip()
+                if proc.returncode == 0 and code in {"200", "204"}:
+                    return True, ""
+                err_msg = (proc.stderr or f"HTTP {code or '000'}").strip()
+                last_err = err_msg.splitlines()[-1][:180]
+                continue
+            except subprocess.TimeoutExpired:
+                last_err = f"egress/DNS probe timed out (>{timeout:.1f}s)"
+                continue
+            except Exception as exc:
+                last_err = str(exc)[:180]
+                continue
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "developer-infra-status/2.2"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if getattr(resp, "status", 200) in {200, 204}:
+                    return True, ""
+        except Exception as exc:
+            last_err = str(exc)[:180]
+    return False, last_err
+
+
+def _probe_egress_once() -> Dict[str, Any]:
+    """
+    Resilient multi-provider L7 HTTPS egress probe with bounded worst-case latency:
+    1. Fast zero-rate-limit HTTPS connectivity check (generate_204). If this fails,
+       fail fast (~2.5s) instead of waiting on 4 GeoIP providers over a dead tunnel.
+    2. If L7 HTTPS is alive, resolve exit IP/geo via multi-provider fallback within
+       a 4s budget so shared-VPN HTTP 429 on ipinfo.io never trips DEGRADED_NO_EGRESS.
+    """
+    result: Dict[str, Any] = {"ok": False, "ip": "", "country": "", "org": "", "error": ""}
+
+    l7_ok, l7_err = _probe_http_204(timeout=2.5)
+    if not l7_ok:
+        result["error"] = l7_err or "no egress"
+        return result
+
+    deadline = time.monotonic() + 4.0
+    any_http_429 = False
+
+    for provider, url, kind in GEOIP_PROVIDERS:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.4:
+            break
+        ok, body, err = _http_get_text(url, timeout=min(2.0, remaining))
+        if ok:
+            try:
+                parsed = _parse_geoip_payload(provider, kind, body)
+            except Exception:
+                continue
+            if parsed:
+                result["ok"] = True
+                result["ip"] = parsed["ip"]
+                result["country"] = parsed["country"]
+                result["org"] = parsed["org"]
+                result["source"] = parsed["source"]
+                return result
+        elif "429" in err:
+            any_http_429 = True
+
+    result["ok"] = True
+    result["ip"] = "verified (GeoIP rate-limited)" if any_http_429 else "verified (HTTP 204)"
+    result["country"] = ""
+    result["org"] = ""
+    result["source"] = "generate_204"
     return result
 
 
-def probe_egress(force: bool = False) -> Dict[str, Any]:
+def probe_egress(force: bool = False, active_node: str = "") -> Dict[str, Any]:
     now = time.monotonic()
     with _EGRESS_LOCK:
         cached = _EGRESS_CACHE["data"]
         cached_ts = _EGRESS_CACHE["ts"]
-    if not force and cached is not None and (now - cached_ts) < EGRESS_CACHE_TTL:
+        geoip_ts = _EGRESS_CACHE["geoip_ts"]
+        cached_node = _EGRESS_CACHE["node"]
+
+    same_node = (not active_node) or (cached_node == active_node)
+    if not force and cached is not None and same_node and (now - cached_ts) < EGRESS_CACHE_TTL:
         return cached
 
+    # Steady-state L7 check: if GeoIP is fresh for this node, verify via zero-rate-limit 204 probe
+    if (
+        cached is not None
+        and cached.get("ok")
+        and cached.get("source") != "generate_204"
+        and same_node
+        and (now - geoip_ts) < GEOIP_CACHE_TTL
+    ):
+        l7_ok, l7_err = _probe_http_204(timeout=3.0)
+        if l7_ok:
+            refreshed = dict(cached)
+            with _EGRESS_LOCK:
+                _EGRESS_CACHE["ts"] = time.monotonic()
+                _EGRESS_CACHE["data"] = refreshed
+            return refreshed
+        failed = {"ok": False, "ip": "", "country": "", "org": "", "error": l7_err}
+        with _EGRESS_LOCK:
+            _EGRESS_CACHE["ts"] = time.monotonic()
+            _EGRESS_CACHE["data"] = failed
+        return failed
+
     result = _probe_egress_once()
+    now_after = time.monotonic()
     with _EGRESS_LOCK:
-        _EGRESS_CACHE["ts"] = time.monotonic()
+        _EGRESS_CACHE["ts"] = now_after
         _EGRESS_CACHE["data"] = result
+        if result.get("ok") and result.get("source") != "generate_204":
+            _EGRESS_CACHE["geoip_ts"] = now_after
+            _EGRESS_CACHE["node"] = active_node
     return result
 
 
 def _background_egress_refresher() -> None:
     while True:
         try:
-            probe_egress(force=True)
+            proxies = query_clash_proxies()
+            _, leaf_node, _, _, _ = resolve_active_node(proxies)
+            probe_egress(force=True, active_node=leaf_node)
         except Exception:
             pass
         time.sleep(EGRESS_CACHE_TTL)
@@ -232,7 +384,7 @@ def collect_status(force_egress: bool = False, skip_egress: bool = False) -> Dic
             cached = _EGRESS_CACHE["data"]
         egress = cached or {"ok": False, "ip": "", "country": "", "org": "", "error": "fast-mode (skipped)"}
     else:
-        egress = probe_egress(force=force_egress)
+        egress = probe_egress(force=force_egress, active_node=leaf_node)
 
     return {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
@@ -266,11 +418,15 @@ def render_html(st: Dict[str, Any]) -> str:
 
     errs_html = "".join(f"<li>{html.escape(e)}</li>" for e in st["recent_errors"]) or "<li>No recent errors</li>"
     delay_str = f"{st['delay_ms']} ms" if st["delay_ms"] is not None else "n/a"
-    egress_str = (
-        f"{html.escape(egress['ip'])} ({html.escape(egress['country'])}) — {html.escape(egress['org'])}"
-        if egress.get("ok")
-        else f"FAILED: {html.escape(egress.get('error') or 'no egress')}"
-    )
+    if egress.get("ok"):
+        eg_parts = [html.escape(egress.get("ip") or "verified")]
+        if egress.get("country"):
+            eg_parts[0] += f" ({html.escape(egress['country'])})"
+        if egress.get("org"):
+            eg_parts.append(html.escape(egress["org"]))
+        egress_str = " — ".join(eg_parts)
+    else:
+        egress_str = f"FAILED: {html.escape(egress.get('error') or 'no egress')}"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -308,7 +464,7 @@ def render_html(st: Dict[str, Any]) -> str:
         <div class="kv"><div class="k">Active Node</div><div class="v">{html.escape(st['active_node'])} ({delay_str})</div></div>
         <div class="kv"><div class="k">Reachable Nodes</div><div class="v">{st['reachable_nodes']} / {st['total_nodes']}</div></div>
         <div class="kv" style="grid-column: 1 / -1;"><div class="k">Agent Egress Policy</div><div class="v">{html.escape(str(st.get('agent_policy', 'open')))}</div></div>
-        <div class="kv" style="grid-column: 1 / -1;"><div class="k">Live Egress (ipinfo.io)</div><div class="v">{egress_str}</div></div>
+        <div class="kv" style="grid-column: 1 / -1;"><div class="k">Live Egress</div><div class="v">{egress_str}</div></div>
       </div>
       <div class="links">
         <a href="/?refresh=1">Refresh Now</a>
@@ -321,7 +477,7 @@ def render_html(st: Dict[str, Any]) -> str:
       <div class="k">Recent sing-box warnings / errors</div>
       <ul>{errs_html}</ul>
       <p class="muted" style="margin-top:12px;">
-        Host controls: <code>vpn-ctl status</code> &middot; <code>vpn-ctl select</code> &middot; <code>vpn-ctl retest</code> &middot; <code>vpn-ctl strict | proxy | direct</code>
+        Host controls: <code>vpn-ctl status</code> &middot; <code>vpn-ctl select</code> &middot; <code>vpn-ctl retest</code> &middot; <code>vpn-ctl strict / proxy / direct</code>
       </p>
     </div>
   </div>

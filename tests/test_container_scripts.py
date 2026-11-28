@@ -419,6 +419,69 @@ class TestContainerScripts(unittest.TestCase):
             self.assertIn("DNS Reject    : True", res.stdout)
             self.assertIn("anthropic.com, github.com", res.stdout)
 
+    def test_vpn_status_server_429_fallback_and_204_steady_state(self):
+        import importlib.util
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location("vpn_status_server_429", ROOT / "container/vpn-status-server.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # 1. When primary GeoIP returns 429, second provider succeeds cleanly
+        def fake_get_second_ok(url, timeout=3.0):
+            if "api.ip.sb" in url:
+                return False, "", "curl: (22) The requested URL returned error: 429"
+            if "ipwho.is" in url:
+                return True, '{"success":true,"ip":"198.51.100.7","country_code":"DE","connection":{"org":"Hetzner"}}', ""
+            return False, "", "unexpected"
+
+        with (
+            mock.patch.object(mod, "_probe_http_204", return_value=(True, "")),
+            mock.patch.object(mod, "_http_get_text", side_effect=fake_get_second_ok),
+        ):
+            res = mod._probe_egress_once()
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["ip"], "198.51.100.7")
+        self.assertEqual(res["country"], "DE")
+        self.assertEqual(res["org"], "Hetzner")
+        self.assertEqual(res["source"], "ipwho.is")
+
+        # 2. When ALL GeoIP providers return HTTP 429, generate_204 proves VPN is UP (never false DEGRADED)
+        with (
+            mock.patch.object(mod, "_probe_http_204", return_value=(True, "")),
+            mock.patch.object(mod, "_http_get_text", return_value=(False, "", "curl: (22) error: 429")),
+        ):
+            res_204 = mod._probe_egress_once()
+        self.assertTrue(res_204["ok"])
+        self.assertIn("rate-limited", res_204["ip"])
+        self.assertEqual(res_204["source"], "generate_204")
+
+        # 2b. When generate_204 fails (dead tunnel), fail fast without querying GeoIP providers
+        with (
+            mock.patch.object(mod, "_probe_http_204", return_value=(False, "egress/DNS probe timed out (>2.5s)")),
+            mock.patch.object(mod, "_http_get_text") as m_geo_dead,
+        ):
+            res_dead = mod._probe_egress_once()
+        self.assertFalse(res_dead["ok"])
+        self.assertEqual(m_geo_dead.call_count, 0)
+
+        # 3. Steady-state force refresh reuses fresh GeoIP cache via zero-rate-limit 204 probe
+        mod._EGRESS_CACHE.update({"ts": 0.0, "geoip_ts": 0.0, "node": "", "data": None})
+        with (
+            mock.patch.object(mod, "_http_get_text", side_effect=fake_get_second_ok) as m_geo,
+            mock.patch.object(mod, "_probe_http_204", return_value=(True, "")) as m_204,
+        ):
+            first = mod.probe_egress(force=True, active_node="DE-1")
+            second = mod.probe_egress(force=True, active_node="DE-1")
+        self.assertTrue(first["ok"] and second["ok"])
+        self.assertEqual(second["ip"], "198.51.100.7")
+        self.assertEqual(m_204.call_count, 2, "Both initial and steady-state checks verify via 204 probe")
+        self.assertEqual(m_geo.call_count, 2, "GeoIP providers should not be re-queried within GEOIP_CACHE_TTL")
+
+        # 4. Banner must never use ambiguous shell pipe `vpn-ctl status |`
+        banner = (ROOT / "container/bashrc-vpn-banner.sh").read_text(encoding="utf-8")
+        self.assertNotIn("vpn-ctl status |", banner)
+
 
 if __name__ == "__main__":
     unittest.main()

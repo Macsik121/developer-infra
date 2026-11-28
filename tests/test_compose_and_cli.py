@@ -178,13 +178,21 @@ class TestComposeAndCli(unittest.TestCase):
 
     def test_multistage_lite_and_full_profiles_invariants(self):
         df = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertTrue(df.startswith("# syntax=docker/dockerfile:1"), "Dockerfile must declare BuildKit syntax header")
+        # Zero-Docker-Hub bootstrap: never declare a `# syntax=` external frontend or `--mount=type=cache`
+        self.assertNotRegex(
+            df,
+            r"(?im)^\s*#\s*syntax\s*=",
+            "External syntax frontend requires Docker Hub (breaks restricted networks)",
+        )
+        self.assertNotIn("--mount=type=cache", df, "BuildKit cache mounts require external syntax frontend on older parsers")
+        self.assertIn("ARG BASE_IMAGE=public.ecr.aws/ubuntu/ubuntu:24.04", df)
+        self.assertIn("FROM ${BASE_IMAGE} AS base-net", df)
+        self.assertIn("ARG APT_MIRROR=", df)
+        self.assertIn("ARG NPM_REGISTRY=", df)
         for stage in ["AS base-net", "FROM base-net AS lite", "FROM base-net AS full-deps", "FROM full-deps AS full"]:
             self.assertIn(stage, df, f"Missing multi-stage target '{stage}' in Dockerfile")
         self.assertIn("ENV DEV_INFRA_PROFILE=lite", df)
         self.assertIn("ENV DEV_INFRA_PROFILE=full", df)
-        self.assertIn("--mount=type=cache,target=/var/cache/apt", df)
-        self.assertIn("--mount=type=cache,target=/root/.npm", df)
         # Ensure heavy full-deps (nodejs/code-server/claude-code/omniroute) live strictly AFTER base-net/lite
         idx_lite_end = df.index("FROM base-net AS full-deps")
         base_and_lite = df[:idx_lite_end]
@@ -193,6 +201,9 @@ class TestComposeAndCli(unittest.TestCase):
 
         compose = (ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
         self.assertIn("target: ${DEV_INFRA_PROFILE:-full}", compose)
+        self.assertIn("BASE_IMAGE: ${BASE_IMAGE:-public.ecr.aws/ubuntu/ubuntu:24.04}", compose)
+        self.assertIn("APT_MIRROR: ${APT_MIRROR:-}", compose)
+        self.assertIn("NPM_REGISTRY: ${NPM_REGISTRY:-}", compose)
         self.assertIn("dev.infra.profile=${DEV_INFRA_PROFILE:-full}", compose)
 
         sup = (ROOT / "supervisord.conf").read_text(encoding="utf-8")
@@ -209,6 +220,7 @@ class TestComposeAndCli(unittest.TestCase):
         self.assertIn("--profile)", re_sh)
         self.assertIn("export DEV_INFRA_PROFILE=", re_sh)
         self.assertIn("export DOCKER_BUILDKIT=1", re_sh)
+        self.assertIn("getent ahosts", re_sh)
 
         diag_ps1 = (ROOT / "diag-env.ps1").read_text(encoding="utf-8")
         self.assertIn("DEV_INFRA_PROFILE", diag_ps1)

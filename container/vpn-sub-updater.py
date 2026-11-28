@@ -69,8 +69,12 @@ VPN_CTL_BIN = os.environ.get("VPN_CTL_BIN", "/usr/local/bin/vpn-ctl")
 
 # WP-3 (D12): Opt-in AI-agent domain allowlist presets (used only when VPN_AGENT_POLICY=allowlist)
 INTERNAL_INFRA_EXACT_DOMAINS: Tuple[str, ...] = (
+    "api.ip.sb",
+    "ipwho.is",
     "ipinfo.io",
+    "ifconfig.me",
     "www.gstatic.com",
+    "cp.cloudflare.com",
 )
 AGENT_POLICY_PRESETS: Dict[str, Tuple[str, ...]] = {
     "ai": (

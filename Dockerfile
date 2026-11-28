@@ -1,9 +1,12 @@
-# syntax=docker/dockerfile:1
 # ==============================================================================
-# developer-infra — Multi-Stage BuildKit Dockerfile (v2.2.3)
+# developer-infra — Multi-Stage Dockerfile (v2.2.4, Zero-Docker-Hub Bootstrap)
+#
+# No `# syntax=docker/dockerfile:1` directive on purpose: BuildKit uses its
+# built-in parser and NEVER calls registry-1.docker.io/v2/docker/dockerfile
+# (fixes builds on restricted networks / hosts without a pre-existing VPN).
 #
 # Build targets (selected via DEV_INFRA_PROFILE or `run-env --profile / -Profile`):
-#   - lite : Fast first-run image (~60-90s): networking + sing-box TUN VPN + X11/noVNC + Chromium.
+#   - lite : Fast first-run image: networking + sing-box TUN VPN + X11/noVNC + Chromium.
 #            Use this to verify VPN subscription, routing & Chromium before installing heavy IDE/AI tools.
 #   - full : Complete dev environment (default): reuses 100% of `base-net` cache and adds
 #            python3-pip/venv, Node.js 22 LTS, code-server, Claude Code & OmniRoute.
@@ -15,32 +18,42 @@
 # for both lite and full without invalidating Chromium, Node.js, code-server, or npm layers.
 # ==============================================================================
 
+# Official Canonical Ubuntu 24.04 on AWS Public ECR (multi-arch amd64/arm64, avoids Docker Hub blocks/limits).
+# Override via BASE_IMAGE in .env (e.g., dockerhub.timeweb.cloud/library/ubuntu:24.04 or ubuntu:24.04).
+ARG BASE_IMAGE=public.ecr.aws/ubuntu/ubuntu:24.04
+
 # ------------------------------------------------------------------------------
 # Stage 1: base-net — Core networking, sing-box, X11/noVNC, Chromium & coder user
 # ------------------------------------------------------------------------------
-FROM ubuntu:24.04 AS base-net
+FROM ${BASE_IMAGE} AS base-net
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Pinned core versions (D10) — override via --build-arg when upgrading
+# Pinned core versions (D10) & optional network mirrors — override via .env / --build-arg
 ARG TARGETARCH=amd64
 ARG SING_BOX_VERSION=1.12.8
 ARG SING_BOX_SHA256_AMD64=b41d9ae438a4367e5fd5c4aa36fe040d0c1bfe5f91f96a072eef31f61d46670c
 ARG SING_BOX_SHA256_ARM64=
+ARG APT_MIRROR=
 
-# Keep downloaded .deb archives inside BuildKit cache mount across rebuilds
-RUN rm -f /etc/apt/apt.conf.d/docker-clean \
-    && printf 'Binary::apt::APT::Keep-Downloaded-Packages "true";\n' > /etc/apt/apt.conf.d/keep-cache
+# Optional APT mirror rewrite for Ubuntu 24.04 (DEB822 ubuntu.sources + legacy sources.list)
+RUN if [ -n "${APT_MIRROR}" ]; then \
+        MIRROR="${APT_MIRROR%/}"; \
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do \
+            if [ -f "$f" ]; then \
+                sed -i -E "s|https?://(archive|security)\.ubuntu\.com/ubuntu|${MIRROR}|g" "$f"; \
+            fi; \
+        done; \
+    fi
 
 # 1. Core utilities, networking, Python runtime, Supervisor, X11/noVNC & GUI notifications
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl wget git unzip nano jq ca-certificates gnupg iputils-ping dnsutils \
     iptables iproute2 supervisor dos2unix procps \
     python3 \
     xvfb x11vnc novnc websockify fluxbox dbus-x11 \
-    x11-apps x11-utils libnotify-bin dunst
+    x11-apps x11-utils libnotify-bin dunst \
+    && rm -rf /var/lib/apt/lists/*
 
 # 2. sing-box pre-baked at build time with SHA256 verification (F4, D10)
 RUN set -eux; \
@@ -70,11 +83,10 @@ RUN set -eux; \
     /usr/local/bin/sing-box version
 
 # 3. Chromium from PPA (avoids Ubuntu 24 snap package which breaks in Docker)
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends software-properties-common \
+RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common \
     && add-apt-repository -y ppa:xtradeb/apps \
-    && apt-get update && apt-get install -y --no-install-recommends chromium
+    && apt-get update && apt-get install -y --no-install-recommends chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 # 4. Unprivileged developer user — NO sudo / NOPASSWD:ALL (D8)
 RUN useradd -m -s /bin/bash coder
@@ -151,21 +163,22 @@ FROM base-net AS full-deps
 ARG CODE_SERVER_VERSION=4.146.0
 ARG CLAUDE_CODE_VERSION=2.1.331
 ARG OMNIROUTE_VERSION=3.8.54
+ARG NPM_REGISTRY=
 
 # 7. Python dev tooling & Node.js v22 LTS
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
-    && apt-get install -y --no-install-recommends python3-pip python3-venv nodejs
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends python3-pip python3-venv nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
 # 8. code-server (pinned)
 RUN curl -fsSL https://code-server.dev/install.sh | sh -s -- --version="${CODE_SERVER_VERSION}"
 
-# 9. Claude Code & OmniRoute (pinned)
-RUN --mount=type=cache,target=/root/.npm \
-    npm install -g \
+# 9. Claude Code & OmniRoute (pinned; supports optional NPM_REGISTRY mirror)
+RUN if [ -n "${NPM_REGISTRY}" ]; then npm config set registry "${NPM_REGISTRY}"; fi \
+    && npm install -g \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-    "omniroute@${OMNIROUTE_VERSION}"
+    "omniroute@${OMNIROUTE_VERSION}" \
+    && npm cache clean --force
 
 # ------------------------------------------------------------------------------
 # Stage 4: full — Complete developer-infra image (default final stage)

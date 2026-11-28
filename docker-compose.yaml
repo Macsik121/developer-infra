@@ -5,6 +5,10 @@ services:
       context: .
       dockerfile: Dockerfile
       target: ${DEV_INFRA_PROFILE:-full}
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-public.ecr.aws/ubuntu/ubuntu:24.04}
+        APT_MIRROR: ${APT_MIRROR:-}
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
     hostname: ${COMPOSE_PROJECT_NAME:-devbox-main}
 
     # Resource limits parameterized via .env (D2):

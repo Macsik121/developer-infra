@@ -262,6 +262,27 @@ docker run --rm --entrypoint python3 -v "$($PWD.Path):/repo:ro" -w /repo ghcr.io
   - Убедитесь, что для Windows WSL2 используется `docker-compose.wslg.yaml` (дефолт `run-env.ps1`), а для Hyper-V/Linux — `docker-compose.headless.yaml` (`-Mode headless` / дефолт `run-env.sh`).
   - Для WSLg (`:0`) сервисы `xvfb`/`fluxbox`/`x11vnc`/`novnc` намеренно завершаются со статусом `EXITED` (это норма, не ошибка).
   - Если Chromium грузит CPU под WSLg, задайте `CHROMIUM_DISABLE_GPU=1` в `.env`.
+- **Ошибка сборки `registry-1.docker.io` / `lookup ... on [::1]:53: connection refused` (без предварительного VPN на хосте):**
+  1. **Не собирайте образ локально без надобности:** свежие `run-env.sh` / `run-env.ps1` сначала тянут готовый образ `${DEV_INFRA_IMAGE}:lite` из GHCR (в обход Docker Hub).
+  2. **Сборка без Docker Hub:** `Dockerfile` больше не использует `# syntax=docker/dockerfile:1` (нет запроса в `docker.io/docker/dockerfile:1`), а базовый образ по умолчанию берётся с официального Canonical AWS ECR (`BASE_IMAGE=public.ecr.aws/ubuntu/ubuntu:24.04`). При необходимости задайте в `.env` локальные зеркала:
+     ```env
+     BASE_IMAGE=dockerhub.timeweb.cloud/library/ubuntu:24.04
+     APT_MIRROR=https://mirror.yandex.ru/ubuntu
+     NPM_REGISTRY=https://registry.npmmirror.com
+     ```
+  3. **Если видите `lookup ... on [::1]:53: connection refused` на Linux/Ubuntu VM (например, `osboxes`):** у хоста/демона Docker сломан DNS (`/etc/resolv.conf`). Пропишите DNS и (опционально) зеркала в `/etc/docker/daemon.json` и перезапустите Docker:
+     ```json
+     {
+       "dns": ["1.1.1.1", "8.8.8.8"],
+       "registry-mirrors": [
+         "https://dockerhub.timeweb.cloud",
+         "https://mirror.gcr.io"
+       ]
+     }
+     ```
+     ```bash
+     sudo systemctl restart docker
+     ```
 - **Проверка конфигурации Compose перед запуском:**
   ```bash
   docker compose -f docker-compose.yaml -f docker-compose.wslg.yaml config

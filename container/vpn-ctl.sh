@@ -523,13 +523,14 @@ auto_now = d.get("auto_proxy_now", "")
 leaf = d.get("active_node", "n/a")
 delay = d.get("delay_ms")
 delay_s = f" ({delay} ms)" if delay is not None else ""
-node_str = f"{sel} -> {leaf}{delay_s}" if sel == "auto-proxy" and leaf != sel else f"{leaf}{delay_s}"
+node_str = f"{sel} -> {leaf}{delay_s}" if sel == "auto-proxy" and leaf != sel and not leaf.startswith("auto-proxy") else f"{leaf}{delay_s}"
 eg = d.get("egress") or {}
 if eg.get("ok"):
     ip = eg.get("ip", "")
-    country = eg.get("country", "?")
+    country = eg.get("country", "")
     org = eg.get("org", "")
-    eg_str = f"{ip} ({country}) - {org}" if org else f"{ip} ({country})"
+    head = f"{ip} ({country})" if country else (ip or "verified")
+    eg_str = f"{head} - {org}" if org else head
 else:
     err = eg.get("error") or "no egress"
     eg_str = f"FAILED ({err})"
