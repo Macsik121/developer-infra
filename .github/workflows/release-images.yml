@@ -1,0 +1,157 @@
+name: Release Multi-Arch GHCR Images
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+    paths-ignore:
+      - "README.md"
+      - "LICENSE"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Target OCI platforms"
+        required: false
+        default: "linux/amd64,linux/arm64"
+      export_lite_tarball:
+        description: "Also upload offline developer-infra-lite-amd64.tar.gz artifact"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    name: Build & Push GHCR (:lite & :full)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run unit tests before publishing
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Resolve lowercase GHCR repository name & sing-box arm64 SHA256
+        id: vars
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${REGISTRY}/$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+          PLATFORMS="${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}"
+          echo "platforms=${PLATFORMS}" >> "$GITHUB_OUTPUT"
+
+          SB_VER="$(sed -nE 's/^ARG SING_BOX_VERSION=(.+)$/\1/p' Dockerfile | head -n 1)"
+          ARM64_TARBALL="sing-box-${SB_VER}-linux-arm64.tar.gz"
+          ARM64_SHA="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SB_VER}" \
+            | jq -r --arg name "$ARM64_TARBALL" '.assets[] | select(.name == $name) | .digest // empty' \
+            | sed 's/^sha256://')"
+          echo "sing_box_sha256_arm64=${ARM64_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (for multi-arch arm64 builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata for lite target
+        id: meta-lite
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: |
+            type=raw,value=lite
+            type=semver,pattern={{version}}-lite
+            type=sha,prefix=lite-,format=short
+          labels: |
+            org.opencontainers.image.title=developer-infra (lite)
+            org.opencontainers.image.description=Lightweight Ubuntu 24.04 + sing-box TUN VPN + X11/noVNC + Chromium verification image
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push :lite multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: lite
+          platforms: ${{ steps.vars.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta-lite.outputs.tags }}
+          labels: ${{ steps.meta-lite.outputs.labels }}
+          build-args: |
+            SING_BOX_SHA256_ARM64=${{ steps.vars.outputs.sing_box_sha256_arm64 }}
+          cache-from: type=gha,scope=lite
+          cache-to: type=gha,mode=max,scope=lite
+
+      - name: Extract Docker metadata for full target
+        id: meta-full
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.vars.outputs.image }}
+          tags: |
+            type=raw,value=full
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=full-,format=short
+          labels: |
+            org.opencontainers.image.title=developer-infra (full)
+            org.opencontainers.image.description=Complete Ubuntu 24.04 devbox with sing-box TUN VPN, Chromium, code-server, OmniRoute & Claude Code
+            org.opencontainers.image.licenses=MIT
+
+      - name: Build and push :full multi-arch image (reusing lite cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: full
+          platforms: ${{ steps.vars.outputs.platforms }}
+          push: true
+          tags: ${{ steps.meta-full.outputs.tags }}
+          labels: ${{ steps.meta-full.outputs.labels }}
+          build-args: |
+            SING_BOX_SHA256_ARM64=${{ steps.vars.outputs.sing_box_sha256_arm64 }}
+          cache-from: |
+            type=gha,scope=full
+            type=gha,scope=lite
+          cache-to: type=gha,mode=max,scope=full
+
+      - name: Export optional offline lite tarball (amd64)
+        if: ${{ inputs.export_lite_tarball == true }}
+        run: |
+          set -euo pipefail
+          docker pull --platform linux/amd64 "${{ steps.vars.outputs.image }}:lite"
+          docker save "${{ steps.vars.outputs.image }}:lite" | gzip -6 > developer-infra-lite-amd64.tar.gz
+          ls -lh developer-infra-lite-amd64.tar.gz
+
+      - name: Upload offline lite tarball artifact
+        if: ${{ inputs.export_lite_tarball == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: developer-infra-lite-amd64-tarball
+          path: developer-infra-lite-amd64.tar.gz
+          retention-days: 14

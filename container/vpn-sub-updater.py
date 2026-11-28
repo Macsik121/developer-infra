@@ -67,6 +67,61 @@ ETC_SINGBOX_DIR = os.environ.get("DEV_INFRA_ETC_SINGBOX_DIR", "/etc/sing-box")
 SING_BOX_BIN = os.environ.get("SING_BOX_BIN", "/usr/local/bin/sing-box")
 VPN_CTL_BIN = os.environ.get("VPN_CTL_BIN", "/usr/local/bin/vpn-ctl")
 
+# WP-3 (D12): Opt-in AI-agent domain allowlist presets (used only when VPN_AGENT_POLICY=allowlist)
+INTERNAL_INFRA_EXACT_DOMAINS: Tuple[str, ...] = (
+    "ipinfo.io",
+    "www.gstatic.com",
+)
+AGENT_POLICY_PRESETS: Dict[str, Tuple[str, ...]] = {
+    "ai": (
+        "anthropic.com",
+        "claude.ai",
+        "openai.com",
+        "googleapis.com",
+        "openrouter.ai",
+        "deepseek.com",
+        "nvidia.com",
+        "huggingface.co",
+        "hf.co",
+    ),
+    "git": (
+        "github.com",
+        "githubusercontent.com",
+        "githubassets.com",
+        "github.io",
+        "gitlab.com",
+        "bitbucket.org",
+    ),
+    "pkg": (
+        "npmjs.org",
+        "npmjs.com",
+        "yarnpkg.com",
+        "pypi.org",
+        "pythonhosted.org",
+        "ubuntu.com",
+        "debian.org",
+        "launchpad.net",
+        "docker.io",
+        "docker.com",
+        "ghcr.io",
+        "crates.io",
+        "pkg.go.dev",
+        "proxy.golang.org",
+    ),
+    "docs": (
+        "stackoverflow.com",
+        "mozilla.org",
+        "python.org",
+        "nodejs.org",
+        "postgresql.org",
+        "kubernetes.io",
+    ),
+}
+_VALID_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
+)
+_DNS_REJECT_QTYPES: List[str] = ["A", "AAAA", "CNAME", "HTTPS", "SVCB", "TXT", "SRV", "MX"]
+
 
 def log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -743,6 +798,163 @@ def probe_reachable_nodes(
     return selected, len(probe_pool), len(reachable_nodes)
 
 
+def _normalize_domain_entry(raw: str) -> Tuple[Optional[str], bool]:
+    """
+    Validate and normalize a domain allowlist entry.
+    Returns (domain, is_exact):
+      - '=host.example.com' -> ('host.example.com', True)
+      - '*.example.com' or '.example.com' or 'example.com' -> ('example.com', False)
+      - Invalid / wildcard-only / IP / SSRF -> (None, False)
+    """
+    token = (raw or "").strip().lower()
+    if not token:
+        return None, False
+    is_exact = False
+    if token.startswith("="):
+        is_exact = True
+        token = token[1:].strip()
+    elif token.startswith("*."):
+        token = token[2:].strip()
+    elif token.startswith("."):
+        token = token[1:].strip()
+    token = token.rstrip(".")
+    if not token or "*" in token or "/" in token or ":" in token:
+        return None, False
+    if is_ssrf_host(token):
+        return None, False
+    try:
+        ipaddress.ip_address(token)
+        return None, False
+    except ValueError:
+        pass
+    if not _VALID_DOMAIN_RE.match(token):
+        return None, False
+    return token, is_exact
+
+
+def resolve_agent_policy(
+    policy: str = "open",
+    presets_raw: str = "ai,git,pkg",
+    custom_domains_raw: str = "",
+    extra_exact_domains: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Resolve VPN_AGENT_POLICY ('open' | 'allowlist') into normalized exact & suffix domain lists.
+    Default 'open' preserves unrestricted VPN egress with zero extra rules.
+    """
+    mode = (policy or "open").strip().lower()
+    if mode not in {"open", "allowlist"}:
+        log(f"Warning: unknown VPN_AGENT_POLICY '{mode}'; defaulting to 'open'")
+        mode = "open"
+
+    if mode == "open":
+        return {
+            "policy": "open",
+            "presets": [],
+            "exact_domains": [],
+            "suffix_domains": [],
+            "invalid_entries": [],
+            "summary": "open",
+        }
+
+    chosen_presets: List[str] = []
+    invalid_entries: List[str] = []
+    suffix_set = set()
+    exact_set = set(INTERNAL_INFRA_EXACT_DOMAINS)
+
+    for raw_preset in (presets_raw or "").split(","):
+        p = raw_preset.strip().lower()
+        if not p or p == "none":
+            continue
+        if p in AGENT_POLICY_PRESETS:
+            if p not in chosen_presets:
+                chosen_presets.append(p)
+            suffix_set.update(AGENT_POLICY_PRESETS[p])
+        else:
+            invalid_entries.append(f"preset:{p}")
+
+    for raw_dom in (custom_domains_raw or "").split(","):
+        if not raw_dom.strip():
+            continue
+        dom, is_exact = _normalize_domain_entry(raw_dom)
+        if dom is None:
+            invalid_entries.append(raw_dom.strip())
+            continue
+        if is_exact:
+            exact_set.add(dom)
+        else:
+            suffix_set.add(dom)
+
+    for extra in extra_exact_domains or []:
+        dom, _ = _normalize_domain_entry(f"={extra}")
+        if dom:
+            exact_set.add(dom)
+
+    # Remove exact domains already covered by an allowed suffix to keep rules compact
+    exact_domains = sorted(
+        d for d in exact_set if not any(d == s or d.endswith("." + s) for s in suffix_set)
+    )
+    suffix_domains = sorted(suffix_set)
+    presets_label = ",".join(chosen_presets) if chosen_presets else "none"
+    total_rules = len(exact_domains) + len(suffix_domains)
+    summary = f"allowlist (presets={presets_label}, domains={total_rules})"
+    return {
+        "policy": "allowlist",
+        "presets": chosen_presets,
+        "exact_domains": exact_domains,
+        "suffix_domains": suffix_domains,
+        "invalid_entries": invalid_entries,
+        "summary": summary,
+    }
+
+
+def apply_agent_policy_rules(cfg: Dict[str, Any], policy_info: Dict[str, Any]) -> None:
+    """
+    Inject sing-box 1.12 route & DNS allowlist rules in-place when policy == 'allowlist'.
+    Leaves 'open' configs untouched.
+    """
+    if policy_info.get("policy") != "allowlist":
+        return
+
+    exact_domains: List[str] = list(policy_info.get("exact_domains") or [])
+    suffix_domains: List[str] = list(policy_info.get("suffix_domains") or [])
+
+    route = cfg.setdefault("route", {})
+    base_rules: List[Dict[str, Any]] = [
+        {"protocol": "dns", "action": "hijack-dns"},
+        {"ip_is_private": True, "outbound": "direct"},
+    ]
+    if exact_domains:
+        base_rules.append({"domain": exact_domains, "outbound": "proxy-select"})
+    if suffix_domains:
+        base_rules.append({"domain_suffix": suffix_domains, "outbound": "proxy-select"})
+    base_rules.append({"network": ["tcp", "udp"], "action": "reject"})
+    route["rules"] = base_rules
+
+    dns = cfg.setdefault("dns", {})
+    dns_rules: List[Dict[str, Any]] = []
+    if exact_domains:
+        dns_rules.append({"domain": exact_domains, "server": "dns-remote"})
+    if suffix_domains:
+        dns_rules.append({"domain_suffix": suffix_domains, "server": "dns-remote"})
+    dns_rules.append({"query_type": list(_DNS_REJECT_QTYPES), "action": "reject"})
+    dns["rules"] = dns_rules
+
+
+def write_policy_state(policy_info: Dict[str, Any]) -> None:
+    """Publish read-only policy summary to /run/vpn/policy (0644) for coder & vpn-status."""
+    try:
+        os.makedirs(RUN_VPN_DIR, exist_ok=True)
+        path = os.path.join(RUN_VPN_DIR, "policy")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(policy_info.get("summary", "open") + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
 def build_singbox_config(
     nodes: List[Dict[str, Any]],
     clash_secret: str,
@@ -750,8 +962,12 @@ def build_singbox_config(
     mtu: int = 1280,
     proxy_only: bool = False,
     tun_address: str = DEFAULT_TUN_ADDRESS,
+    agent_policy: str = "open",
+    allow_presets: str = "ai,git,pkg",
+    allow_domains: str = "",
+    extra_exact_domains: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Build modern sing-box 1.12 configuration preserving all F7/D5/D6/v2.2 invariants."""
+    """Build modern sing-box 1.12 configuration preserving all F7/D5/D6/D12/v2.2 invariants."""
     if not nodes:
         raise ValueError("Cannot build sing-box config with zero valid proxy nodes")
 
@@ -809,7 +1025,7 @@ def build_singbox_config(
         }
     )
 
-    return {
+    cfg: Dict[str, Any] = {
         "log": {
             "level": "info",
             "timestamp": True,
@@ -865,18 +1081,31 @@ def build_singbox_config(
         },
     }
 
+    policy_info = resolve_agent_policy(
+        policy=agent_policy,
+        presets_raw=allow_presets,
+        custom_domains_raw=allow_domains,
+        extra_exact_domains=extra_exact_domains,
+    )
+    apply_agent_policy_rules(cfg, policy_info)
+    return cfg
+
 
 def harden_static_config(
     raw_cfg: Dict[str, Any],
     clash_secret: str,
     cache_path: str = "/var/lib/sing-box/cache.db",
     tun_address: str = DEFAULT_TUN_ADDRESS,
+    agent_policy: str = "open",
+    allow_presets: str = "ai,git,pkg",
+    allow_domains: str = "",
 ) -> Dict[str, Any]:
     """
     Sanitize fallback static /etc/sing-box/config.json:
     - Drops broken empty-tag outbounds (like F7's outbounds[2]).
     - Rewrites colliding 172.16-31.x.x TUN addresses to a safe non-Docker CIDR.
     - Enforces route.default_mark=255, cache_file in /var/lib/sing-box, and Clash API secret.
+    - Applies optional VPN_AGENT_POLICY allowlist rules when enabled.
     """
     cfg = json.loads(json.dumps(raw_cfg))
 
@@ -900,6 +1129,13 @@ def harden_static_config(
     route = cfg.setdefault("route", {})
     route["auto_detect_interface"] = True
     route["default_mark"] = DEFAULT_FWMARK
+
+    policy_info = resolve_agent_policy(
+        policy=agent_policy,
+        presets_raw=allow_presets,
+        custom_domains_raw=allow_domains,
+    )
+    apply_agent_policy_rules(cfg, policy_info)
 
     exp = cfg.setdefault("experimental", {})
     exp["cache_file"] = {"enabled": True, "path": cache_path}
@@ -1212,6 +1448,21 @@ def perform_update(cold_start: bool = False) -> bool:
     except ValueError:
         mtu = 1280
 
+    agent_policy = os.environ.get("VPN_AGENT_POLICY", "open").strip().lower() or "open"
+    allow_presets = os.environ.get("VPN_ALLOW_PRESETS", "ai,git,pkg")
+    allow_domains = os.environ.get("VPN_ALLOW_DOMAINS", "")
+    sub_host_for_policy = urllib.parse.urlsplit(sub_url).hostname or "" if sub_url else ""
+    extra_policy_exact = [sub_host_for_policy] if sub_host_for_policy else []
+    policy_info = resolve_agent_policy(
+        policy=agent_policy,
+        presets_raw=allow_presets,
+        custom_domains_raw=allow_domains,
+        extra_exact_domains=extra_policy_exact,
+    )
+    write_policy_state(policy_info)
+    if policy_info["invalid_entries"]:
+        log(f"Warning: ignored invalid VPN_ALLOW_PRESETS/VPN_ALLOW_DOMAINS entries: {policy_info['invalid_entries']}")
+
     # Step 0: Immediately heal any legacy persisted config whose TUN CIDR collides with eth0
     heal_colliding_active_config(active_path, clash_secret=clash_secret, safe_tun_addr=safe_tun_addr)
 
@@ -1290,10 +1541,17 @@ def perform_update(cold_start: bool = False) -> bool:
                     mtu=mtu,
                     proxy_only=proxy_only,
                     tun_address=safe_tun_addr,
+                    agent_policy=agent_policy,
+                    allow_presets=allow_presets,
+                    allow_domains=allow_domains,
+                    extra_exact_domains=extra_policy_exact,
                 )
                 ok, changed, err = atomic_apply_config(cfg)
                 if ok:
-                    log(f"Applied dynamic config ({len(nodes)} nodes, proxy_only={proxy_only}, changed={changed})")
+                    log(
+                        f"Applied dynamic config ({len(nodes)} nodes, proxy_only={proxy_only}, "
+                        f"policy={policy_info['summary']}, changed={changed})"
+                    )
                     if changed and (not cold_start or had_existing_active):
                         restart_singbox()
                     return True
@@ -1339,6 +1597,9 @@ def perform_update(cold_start: bool = False) -> bool:
                 clash_secret=clash_secret,
                 cache_path=os.path.join(STATE_DIR, "cache.db"),
                 tun_address=safe_tun_addr,
+                agent_policy=agent_policy,
+                allow_presets=allow_presets,
+                allow_domains=allow_domains,
             )
             ok, _, err = atomic_apply_config(hardened, save_last_good=True)
             if ok:

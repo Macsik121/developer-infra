@@ -200,9 +200,9 @@ class TestVpnSubUpdater(unittest.TestCase):
         self.assertEqual(fixed["experimental"]["clash_api"]["secret"], "sec123")
 
     def test_redact_url_never_leaks_secret_path(self):
-        url = "https://auth.quattro-cloud.ru/sub/SUPER_SECRET_TOKEN_999?flag=1"
+        url = "https://sub.example.com/sub/SUPER_SECRET_TOKEN_999?flag=1"
         redacted = updater.redact_url(url)
-        self.assertEqual(redacted, "https://auth.quattro-cloud.ru/<redacted>")
+        self.assertEqual(redacted, "https://sub.example.com/<redacted>")
         self.assertNotIn("SUPER_SECRET_TOKEN_999", redacted)
 
     @unittest.skipIf(os.name == "nt", "POSIX shell stub — run inside Docker container on Windows")
@@ -382,6 +382,78 @@ class TestVpnSubUpdater(unittest.TestCase):
         self.assertEqual(dns_remote["server_port"], 443)
         self.assertEqual(dns_remote["path"], "/dns-query")
         self.assertEqual(dns_remote["detour"], "proxy-select")
+
+    def test_agent_policy_open_mode_leaves_route_and_dns_untouched(self):
+        nodes, _ = updater.parse_subscription_uris(self.F8_URIS, allow_insecure=False)
+        cfg = updater.build_singbox_config(nodes, clash_secret="sec", agent_policy="open")
+        self.assertNotIn("rules", cfg["dns"])
+        self.assertFalse(any(r.get("action") == "reject" for r in cfg["route"]["rules"]))
+        self.assertEqual(cfg["route"]["final"], "proxy-select")
+
+    def test_agent_policy_allowlist_presets_sanitization_and_reject_rules(self):
+        info = updater.resolve_agent_policy(
+            policy="allowlist",
+            presets_raw="ai,git,unknown_preset",
+            custom_domains_raw="*.example.org, =api.custom.dev, localhost, 1.2.3.4, bad*host.com, https://nope.io",
+            extra_exact_domains=["sub.provider.net", "api.github.com"],
+        )
+        self.assertEqual(info["policy"], "allowlist")
+        self.assertEqual(info["presets"], ["ai", "git"])
+        self.assertIn("anthropic.com", info["suffix_domains"])
+        self.assertIn("github.com", info["suffix_domains"])
+        self.assertIn("example.org", info["suffix_domains"])
+        # Exact domains: infra probes + custom exact + subscription host, deduplicating api.github.com (covered by github.com)
+        self.assertIn("ipinfo.io", info["exact_domains"])
+        self.assertIn("www.gstatic.com", info["exact_domains"])
+        self.assertIn("api.custom.dev", info["exact_domains"])
+        self.assertIn("sub.provider.net", info["exact_domains"])
+        self.assertNotIn("api.github.com", info["exact_domains"])
+        # Invalid/SSRF/IP/wildcard entries rejected cleanly
+        self.assertIn("preset:unknown_preset", info["invalid_entries"])
+        self.assertIn("localhost", info["invalid_entries"])
+        self.assertIn("1.2.3.4", info["invalid_entries"])
+        self.assertIn("bad*host.com", info["invalid_entries"])
+
+        nodes, _ = updater.parse_subscription_uris(self.F8_URIS, allow_insecure=False)
+        cfg = updater.build_singbox_config(
+            nodes,
+            clash_secret="sec",
+            agent_policy="allowlist",
+            allow_presets="ai,pkg",
+            allow_domains="=internal-api.company.dev,*.mytool.io",
+            extra_exact_domains=["sub.example.com"],
+        )
+        route_rules = cfg["route"]["rules"]
+        self.assertEqual(route_rules[0], {"protocol": "dns", "action": "hijack-dns"})
+        self.assertEqual(route_rules[1], {"ip_is_private": True, "outbound": "direct"})
+        self.assertEqual(route_rules[-1], {"network": ["tcp", "udp"], "action": "reject"})
+        exact_rule = next(r for r in route_rules if "domain" in r)
+        suffix_rule = next(r for r in route_rules if "domain_suffix" in r)
+        self.assertEqual(exact_rule["outbound"], "proxy-select")
+        self.assertIn("internal-api.company.dev", exact_rule["domain"])
+        self.assertIn("sub.example.com", exact_rule["domain"])
+        self.assertEqual(suffix_rule["outbound"], "proxy-select")
+        self.assertIn("anthropic.com", suffix_rule["domain_suffix"])
+        self.assertIn("pypi.org", suffix_rule["domain_suffix"])
+        self.assertIn("mytool.io", suffix_rule["domain_suffix"])
+
+        dns_rules = cfg["dns"]["rules"]
+        self.assertEqual(dns_rules[-1]["action"], "reject")
+        self.assertIn("A", dns_rules[-1]["query_type"])
+        dns_suffix_rule = next(r for r in dns_rules if "domain_suffix" in r)
+        self.assertEqual(dns_suffix_rule["server"], "dns-remote")
+        self.assertIn("mytool.io", dns_suffix_rule["domain_suffix"])
+
+        # Static config hardening also honors allowlist policy
+        hardened = updater.harden_static_config(
+            {"inbounds": [], "outbounds": [{"type": "direct", "tag": "direct"}]},
+            clash_secret="sec",
+            agent_policy="allowlist",
+            allow_presets="none",
+            allow_domains="allowed.dev",
+        )
+        self.assertEqual(hardened["route"]["rules"][-1], {"network": ["tcp", "udp"], "action": "reject"})
+        self.assertEqual(hardened["dns"]["rules"][-1]["action"], "reject")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import socket
 import stat
@@ -126,7 +127,7 @@ class TestContainerScripts(unittest.TestCase):
             self.assertNotEqual(bad.returncode, 0)
 
             base_env["CODE_SERVER_PASSWORD"] = "RealStrongCodePass#99"
-            base_env["VPN_SUBSCRIPTION_URL"] = "https://auth.quattro-cloud.ru/secret-path"
+            base_env["VPN_SUBSCRIPTION_URL"] = "https://sub.example.com/secret-path"
             base_env["VPN_FAIL_MODE"] = "proxy"
             ok = subprocess.run(
                 ["bash", str(ROOT / "container/entrypoint.sh")],
@@ -375,6 +376,48 @@ class TestContainerScripts(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertEqual((run_dir / "vpn" / "state").read_text().strip(), "DEGRADED_NO_EGRESS")
             self.assertIn("select auto-proxy", ctl_log.read_text(encoding="utf-8"))
+
+    @unittest.skipIf(os.name == "nt", "POSIX bash script test — run inside Docker container on Windows")
+    def test_vpn_ctl_policy_reports_active_allowlist_rules(self):
+        with tempfile.TemporaryDirectory() as td:
+            run_dir = Path(td) / "run"
+            state_dir = Path(td) / "state"
+            (run_dir / "vpn").mkdir(parents=True)
+            state_dir.mkdir(parents=True)
+            (run_dir / "vpn" / "policy").write_text("allowlist (presets=ai,git, domains=17)\n", encoding="utf-8")
+            (state_dir / "config.active.json").write_text(
+                json.dumps(
+                    {
+                        "dns": {"rules": [{"domain_suffix": ["github.com"], "server": "dns-remote"}, {"query_type": ["A"], "action": "reject"}]},
+                        "route": {
+                            "rules": [
+                                {"domain": ["ipinfo.io"], "outbound": "proxy-select"},
+                                {"domain_suffix": ["anthropic.com", "github.com"], "outbound": "proxy-select"},
+                                {"network": ["tcp", "udp"], "action": "reject"},
+                            ]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "DEV_INFRA_RUN_DIR": str(run_dir),
+                    "DEV_INFRA_SINGBOX_STATE_DIR": str(state_dir),
+                }
+            )
+            res = subprocess.run(
+                ["bash", str(ROOT / "container/vpn-ctl.sh"), "policy"],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("Agent Policy  : allowlist (presets=ai,git, domains=17)", res.stdout)
+            self.assertIn("Route Reject  : True", res.stdout)
+            self.assertIn("DNS Reject    : True", res.stdout)
+            self.assertIn("anthropic.com, github.com", res.stdout)
 
 
 if __name__ == "__main__":

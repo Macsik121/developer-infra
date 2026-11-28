@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Static checks, unit tests & Compose validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check POSIX shell syntax and LF line endings
+        run: |
+          set -euo pipefail
+          for f in $(find . -maxdepth 3 -name "*.sh" -not -path "./.git/*"); do
+            bash -n "$f"
+            if grep -q $'\r' "$f"; then
+              echo "CRLF detected in $f" >&2
+              exit 1
+            fi
+          done
+
+      - name: Byte-compile Python scripts and tests
+        run: python3 -m py_compile container/vpn-sub-updater.py container/vpn-status-server.py tests/*.py
+
+      - name: Run unit test suite
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Validate Docker Compose configs (wslg/headless x lite/full)
+        run: |
+          set -euo pipefail
+          cp .env.example .env.ci
+          sed -i 's/CHANGE_ME_STRONG_CODE_PASSWORD/CiTestCodePass99/' .env.ci
+          sed -i 's/CHANGE_ME_STRONG_VNC_PASSWORD/CiTestVncPass99/' .env.ci
+          for profile in lite full; do
+            for overlay in docker-compose.wslg.yaml docker-compose.headless.yaml; do
+              DEV_INFRA_PROFILE="$profile" docker compose --env-file .env.ci -f docker-compose.yaml -f "$overlay" config >/dev/null
+              echo "Validated compose: profile=${profile} overlay=${overlay}"
+            done
+          done
+          rm -f .env.ci
+
+  build-lite-check:
+    name: BuildKit smoke build (lite target, amd64)
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build lite image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: lite
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=lite-amd64
+          cache-to: type=gha,mode=max,scope=lite-amd64

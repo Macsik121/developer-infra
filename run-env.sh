@@ -13,6 +13,7 @@ MODE="headless"
 PROFILE=""
 DETACH=0
 NO_BUILD=0
+LOCAL_BUILD=0
 CHECK_PORTS=0
 AUTO_PORT=0
 
@@ -22,12 +23,13 @@ Usage: ./run-env.sh [OPTIONS]
 
 Options:
   --mode <headless|wslg>   Compose display profile (default: headless)
-  --profile <lite|full>    Build target: 'lite' (fast VPN + Chromium check) or 'full' (IDE + AI stack; default from .env or full)
+  --profile <lite|full>    Image profile: 'lite' (fast VPN + Chromium) or 'full' (IDE + AI stack; default from .env or full)
   --env-file <path>        Path to .env file (default: .env)
   --check-ports            Inspect host port availability / owners & host VPN status, then exit
   --auto-port              Automatically increment (+1) conflicting host ports until free
   --detach, -d             Start container without attaching interactive shell
-  --no-build               Skip --build on docker compose up
+  --local-build            Force local BuildKit build (--build) instead of pulling pre-built GHCR image first
+  --no-build               Start existing/cached local image without pulling or building (--no-build)
   -h, --help               Show this help
 EOF
 }
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --check-ports) CHECK_PORTS=1; shift ;;
         --auto-port)   AUTO_PORT=1; shift ;;
         -d|--detach)   DETACH=1; shift ;;
+        --local-build) LOCAL_BUILD=1; shift ;;
         --no-build)    NO_BUILD=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         *)             echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -97,6 +100,7 @@ CODE_PORT="$(get_env_val CODE_SERVER_PORT)"; CODE_PORT="${CODE_PORT:-8080}"
 NOVNC_PORT="$(get_env_val NOVNC_PORT)"; NOVNC_PORT="${NOVNC_PORT:-6901}"
 OMNI_PORT="$(get_env_val OMNIROUTE_PORT)"; OMNI_PORT="${OMNI_PORT:-20128}"
 WORKSPACE_DIR="$(get_env_val WORKSPACE_DIR)"; WORKSPACE_DIR="${WORKSPACE_DIR:-./workspace}"
+IMAGE_REPO="$(get_env_val DEV_INFRA_IMAGE)"; IMAGE_REPO="${IMAGE_REPO:-ghcr.io/macsik121/developer-infra}"
 if [[ -z "$PROFILE" ]]; then
     PROFILE="$(get_env_val DEV_INFRA_PROFILE)"
     PROFILE="${PROFILE:-full}"
@@ -238,15 +242,27 @@ else
     COMPOSE_FILES+=(-f docker-compose.headless.yaml)
 fi
 
-UP_ARGS=(up -d)
-[[ "$NO_BUILD" -eq 0 ]] && UP_ARGS+=(--build)
-
 export DEV_INFRA_PROFILE="$PROFILE"
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
-echo "[run-env] Starting developer-infra (mode=${MODE}, profile=${PROFILE}, env=${ENV_FILE})..."
-docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" "${UP_ARGS[@]}"
+if [[ "$LOCAL_BUILD" -eq 1 ]]; then
+    echo "[run-env] Local build requested: building and starting developer-infra (mode=${MODE}, profile=${PROFILE}, env=${ENV_FILE})..."
+    docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" up -d --build
+elif [[ "$NO_BUILD" -eq 1 ]]; then
+    echo "[run-env] Starting developer-infra without pull/build (mode=${MODE}, profile=${PROFILE}, env=${ENV_FILE})..."
+    docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" up -d --no-build
+else
+    echo "[run-env] Pull-first mode: checking pre-built image ${IMAGE_REPO}:${PROFILE}..."
+    if docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" pull ubuntu-dev; then
+        echo "[run-env] Pulled ${IMAGE_REPO}:${PROFILE}. Starting container (mode=${MODE}, profile=${PROFILE}, env=${ENV_FILE})..."
+        docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" up -d --no-build
+    else
+        echo "[run-env] Notice: Pre-built image ${IMAGE_REPO}:${PROFILE} not reachable (offline, unpublished, or private GHCR)." >&2
+        echo "          Falling back to local BuildKit build (use --local-build to skip pull check)..." >&2
+        docker compose --env-file "$ENV_FILE" "${COMPOSE_FILES[@]}" up -d --build
+    fi
+fi
 
 echo ""
 if [[ "$PROFILE" == "lite" ]]; then

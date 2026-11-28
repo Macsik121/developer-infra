@@ -1,5 +1,6 @@
 services:
   ubuntu-dev:
+    image: ${DEV_INFRA_IMAGE:-ghcr.io/macsik121/developer-infra}:${DEV_INFRA_PROFILE:-full}
     build:
       context: .
       dockerfile: Dockerfile
@@ -72,6 +73,9 @@ services:
       - VPN_NODE_EXCLUDE=${VPN_NODE_EXCLUDE:-}
       - VPN_FAIL_MODE=${VPN_FAIL_MODE:-strict}
       - VPN_AUTO_FAILOVER=${VPN_AUTO_FAILOVER:-1}
+      - VPN_AGENT_POLICY=${VPN_AGENT_POLICY:-open}
+      - VPN_ALLOW_PRESETS=${VPN_ALLOW_PRESETS:-ai,git,pkg}
+      - VPN_ALLOW_DOMAINS=${VPN_ALLOW_DOMAINS:-}
       - VPN_GUI_NOTIFICATIONS=${VPN_GUI_NOTIFICATIONS:-1}
       - CHROMIUM_START_URL=${CHROMIUM_START_URL:-http://127.0.0.1:9099}
       - CHROMIUM_DISABLE_QUIC=${CHROMIUM_DISABLE_QUIC:-1}

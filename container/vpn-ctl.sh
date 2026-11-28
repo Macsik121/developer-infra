@@ -536,6 +536,7 @@ else:
 
 mode = d.get("mode", "unknown")
 state = d.get("state", "unknown")
+agent_policy = d.get("agent_policy", "open")
 tun_iface = d.get("tun_iface", "sing-tun")
 reachable = d.get("reachable_nodes", 0)
 total = d.get("total_nodes", 0)
@@ -543,6 +544,7 @@ updater = d.get("updater_summary")
 
 print(f"VPN Mode      : {mode}")
 print(f"VPN State     : {state}")
+print(f"Agent Policy  : {agent_policy}")
 print(f"sing-box      : {sb}")
 print(f"TUN Interface : {tun_iface} ({tun})")
 print(f"Active Node   : {node_str}")
@@ -566,15 +568,51 @@ if errs:
     # Graceful offline fallback (used during early startup or unit tests)
     local mode="unknown"
     local state="unknown"
+    local policy="open"
     local tun="DOWN"
     [[ -r "${RUN_VPN_DIR}/mode" ]] && mode="$(tr -d '[:space:]' < "${RUN_VPN_DIR}/mode")"
     [[ -r "${RUN_VPN_DIR}/state" ]] && state="$(tr -d '[:space:]' < "${RUN_VPN_DIR}/state")"
+    [[ -r "${RUN_VPN_DIR}/policy" ]] && policy="$(tr -d '\r\n' < "${RUN_VPN_DIR}/policy")"
     if ip link show "$TUN_IFACE" >/dev/null 2>&1; then
         tun="UP"
     fi
     echo "VPN Mode      : ${mode}"
     echo "VPN State     : ${state}"
+    echo "Agent Policy  : ${policy}"
     echo "TUN Interface : ${TUN_IFACE} (${tun})"
+}
+
+cmd_policy() {
+    local policy="open"
+    [[ -r "${RUN_VPN_DIR}/policy" ]] && policy="$(tr -d '\r\n' < "${RUN_VPN_DIR}/policy")"
+    echo "Agent Policy  : ${policy}"
+    local cfg_path="${DEV_INFRA_SINGBOX_STATE_DIR:-/var/lib/sing-box}/config.active.json"
+    if [[ -r "$cfg_path" ]]; then
+        CFG_PATH="$cfg_path" python3 -c '
+import json, os
+cfg = json.loads(open(os.environ["CFG_PATH"], encoding="utf-8").read())
+rules = (cfg.get("route") or {}).get("rules") or []
+exact = []
+suffix = []
+has_reject = False
+for r in rules:
+    if not isinstance(r, dict):
+        continue
+    if r.get("action") == "reject":
+        has_reject = True
+    if r.get("outbound") == "proxy-select":
+        exact.extend(r.get("domain") or [])
+        suffix.extend(r.get("domain_suffix") or [])
+dns_rules = (cfg.get("dns") or {}).get("rules") or []
+dns_reject = any(isinstance(r, dict) and r.get("action") == "reject" for r in dns_rules)
+print(f"Route Reject  : {has_reject}")
+print(f"DNS Reject    : {dns_reject}")
+if exact:
+    print("Exact Domains : " + ", ".join(sorted(set(exact))))
+if suffix:
+    print("Suffixes (" + str(len(set(suffix))) + ") : " + ", ".join(sorted(set(suffix))))
+'
+    fi
 }
 
 usage() {
@@ -582,7 +620,8 @@ usage() {
 Usage: vpn-ctl <command> [args]
 
 Commands:
-  status                    Show VPN mode, state, resolved node, live egress & errors (read-only)
+  status                    Show VPN mode, state, policy, resolved node, live egress & errors (read-only)
+  policy                    Show active AI-agent domain allowlist policy & effective rules (read-only)
   strict                    Enforce strict IPv4+IPv6+Docker DNS kill-switch + fwmark routing (root/host)
   fallback                  Allow fallback to direct egress if VPN drops (root/host)
   proxy                     Run sing-box as internal HTTP/SOCKS5 proxy on 127.0.0.1:2080 without TUN (root/host)
@@ -598,6 +637,7 @@ shift || true
 
 case "$ACTION" in
     status)           cmd_status ;;
+    policy)           cmd_policy ;;
     init)             cmd_init ;;
     strict)           cmd_strict ;;
     fallback)         cmd_fallback ;;

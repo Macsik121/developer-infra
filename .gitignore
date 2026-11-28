@@ -14,16 +14,13 @@ sing-box/*.db-wal
 sing-box/what-is-my-ip*
 sing-box/sing-box-*/
 
-# User workspace & local data
+# User workspace, diagnostics & local archives
 workspace/
 diagnostics/
 *.log
 *.pid
-
-# AI Studio web console build / runtime artifacts
-node_modules/
-dist/
-.playwright-cli/
+*.zip
+*.tar.gz
 
 # OS & editor artifacts
 .DS_Store

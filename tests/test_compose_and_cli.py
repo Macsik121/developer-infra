@@ -151,6 +151,7 @@ class TestComposeAndCli(unittest.TestCase):
         vc_ps1 = (ROOT / "vpn-ctl.ps1").read_text(encoding="utf-8")
         self.assertIn('"proxy"', vc_ps1)
         self.assertIn('"retest"', vc_ps1)
+        self.assertIn('"policy"', vc_ps1)
 
         # v2.2/v2.2.1 diagnostic & log collection scripts
         for diag_name in ["collect-logs.ps1", "collect-logs.sh", "diag-env.ps1", "diag-env.sh"]:
@@ -216,6 +217,50 @@ class TestComposeAndCli(unittest.TestCase):
         diag_sh = (ROOT / "diag-env.sh").read_text(encoding="utf-8")
         self.assertIn("DEV_INFRA_PROFILE", diag_sh)
         self.assertIn("SKIP(lite)", diag_sh)
+
+    def test_ci_ghcr_workflows_and_pull_first_invariants(self):
+        ci_path = ROOT / ".github" / "workflows" / "ci.yml"
+        rel_path = ROOT / ".github" / "workflows" / "release-images.yml"
+        self.assertTrue(ci_path.is_file(), "Missing .github/workflows/ci.yml")
+        self.assertTrue(rel_path.is_file(), "Missing .github/workflows/release-images.yml")
+
+        ci_text = ci_path.read_text(encoding="utf-8")
+        self.assertIn("python3 -m unittest discover -s tests -v", ci_text)
+        self.assertIn("target: lite", ci_text)
+        self.assertIn("docker-compose.wslg.yaml", ci_text)
+        self.assertIn("docker-compose.headless.yaml", ci_text)
+
+        rel_text = rel_path.read_text(encoding="utf-8")
+        self.assertIn("packages: write", rel_text)
+        self.assertIn("ghcr.io", rel_text)
+        self.assertIn("linux/amd64,linux/arm64", rel_text)
+        self.assertIn("target: lite", rel_text)
+        self.assertIn("target: full", rel_text)
+        self.assertIn("SING_BOX_SHA256_ARM64", rel_text)
+        self.assertIn("export_lite_tarball", rel_text)
+
+        compose = (ROOT / "docker-compose.yaml").read_text(encoding="utf-8")
+        self.assertIn(
+            "image: ${DEV_INFRA_IMAGE:-ghcr.io/macsik121/developer-infra}:${DEV_INFRA_PROFILE:-full}",
+            compose,
+        )
+
+        dockerignore = (ROOT / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn(".github/", dockerignore)
+
+        re_ps1 = (ROOT / "run-env.ps1").read_text(encoding="utf-8")
+        self.assertIn("[switch]$LocalBuild", re_ps1)
+        self.assertIn("DEV_INFRA_IMAGE", re_ps1)
+        self.assertIn("pull ubuntu-dev", re_ps1)
+        self.assertIn("up -d --no-build", re_ps1)
+        self.assertIn("up -d --build", re_ps1)
+
+        re_sh = (ROOT / "run-env.sh").read_text(encoding="utf-8")
+        self.assertIn("--local-build)", re_sh)
+        self.assertIn("DEV_INFRA_IMAGE", re_sh)
+        self.assertIn("pull ubuntu-dev", re_sh)
+        self.assertIn("up -d --no-build", re_sh)
+        self.assertIn("up -d --build", re_sh)
 
 
 if __name__ == "__main__":

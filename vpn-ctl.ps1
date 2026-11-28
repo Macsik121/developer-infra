@@ -4,6 +4,7 @@
 
 .EXAMPLE
     .\vpn-ctl.ps1 status
+    .\vpn-ctl.ps1 policy
     .\vpn-ctl.ps1 strict
     .\vpn-ctl.ps1 fallback
     .\vpn-ctl.ps1 proxy
@@ -18,7 +19,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("status", "strict", "fallback", "proxy", "direct", "update", "retest", "select", "help")]
+    [ValidateSet("status", "policy", "strict", "fallback", "proxy", "direct", "update", "retest", "select", "help")]
     [string]$Action = "status",
 
     [Parameter(Position = 1)]

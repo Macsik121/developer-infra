@@ -29,18 +29,25 @@ cp .env.example .env
 Откройте `.env` и обязательно задайте:
 - `CODE_SERVER_PASSWORD` (минимум 6 символов, без `CHANGE_ME` / `devpassword123`);
 - `VNC_PASSWORD` (минимум 6 символов, для входа в noVNC);
-- `VPN_SUBSCRIPTION_URL` — ссылка на динамическую подписку (например, `https://auth.quattro-cloud.ru/...`), либо оставьте пустой для работы от локального `./sing-box/config.json` (шаблон — в `sing-box/config.json.example`).
+- `VPN_SUBSCRIPTION_URL` — ссылка на динамическую подписку (например, `https://sub.example.com/...`), либо оставьте пустой для работы от локального `./sing-box/config.json` (шаблон — в `sing-box/config.json.example`).
 
 > **Важно про `VPN_ALLOW_INSECURE`, `VPN_MTU` и `VPN_PROBE_NODES`:**
 > - По умолчанию `VPN_ALLOW_INSECURE=0` — ноды с `insecure=1` / `allowInsecure=1` / self-signed `pcs=` пропускаются (`skipped_insecure=...`). Если часть нод провайдера (например, Hysteria2) использует self-signed сертификаты и вы им доверяете, выставьте `VPN_ALLOW_INSECURE=1`.
 > - `VPN_MTU=1280` гарантирует работу без blackhole-фрагментации, даже если на хосте параллельно включён другой VPN/TUN.
 > - `VPN_PROBE_NODES=1` перед запуском проверяет TCP-доступность до 120 кандидатов (деприоритизируя RU/LTE/мост-ноды) и загружает в `sing-box` рабочие и быстрые ноды.
 
-### Шаг 2. Проверка портов и быстрый двухэтапный запуск (`lite` → `full`)
+### Шаг 2. Проверка портов и быстрый двухэтапный запуск (`lite` → `full`, Pull-First GHCR)
 
-Чтобы не ждать долгую установку тяжёлых инструментов (`Node.js 22`, `code-server`, `Claude Code`, `OmniRoute`) до проверки VPN, предусмотрены два multi-stage профиля сборки (`DEV_INFRA_PROFILE` в `.env` или флаг `-Profile` / `--profile`):
-- **`lite`** — только сеть, `sing-box` VPN, X11/noVNC и **Chromium** (~60–90 сек на первый старт).
-- **`full`** (по умолчанию) — **на 100% переиспользует BuildKit-кэш `lite`** и доставляет `code-server`, `Node.js 22`, `OmniRoute` и `Claude Code`.
+Чтобы не зависеть от нестабильного интернета при локальной сборке (`apt`/PPA/GitHub) и не ждать установку тяжёлых инструментов (`Node.js 22`, `code-server`, `Claude Code`, `OmniRoute`) до проверки VPN, предусмотрены два multi-stage профиля (`DEV_INFRA_PROFILE` в `.env` или флаг `-Profile` / `--profile`) и **автоматический pull готовых multi-arch образов (`linux/amd64`, `linux/arm64`) из GHCR**:
+- **`lite`** (`${DEV_INFRA_IMAGE}:lite`) — только сеть, `sing-box` VPN, X11/noVNC и **Chromium** (мгновенный старт из GHCR без `apt`/PPA).
+- **`full`** (`${DEV_INFRA_IMAGE}:full`, по умолчанию) — добавляет `code-server`, `Node.js 22`, `OmniRoute` и `Claude Code` (при локальной сборке на 100% переиспользует BuildKit-кэш `lite`).
+
+По умолчанию `run-env.ps1` / `run-env.sh` работают в режиме **Pull-First**: сначала пытаются скачать `${DEV_INFRA_IMAGE}:${DEV_INFRA_PROFILE}` (по умолчанию `ghcr.io/macsik121/developer-infra`), а если образ недоступен (офлайн, форк ещё не опубликован или пакет приватный) — автоматически откатываются на локальную сборку BuildKit. Для принудительной локальной сборки используйте `-LocalBuild` / `--local-build`, для запуска уже скачанного/собранного образа — `-NoBuild` / `--no-build`.
+
+> **Для владельца репозитория / форка (GHCR + Offline tarball):**
+> - GitHub Actions workflow `.github/workflows/release-images.yml` автоматически собирает и публикует multi-arch теги `:lite`, `:full`, `:latest` и `vX.Y.Z` в `ghcr.io/<owner>/<repo>` при пуше в `main` или теге `v*`.
+> - После первой публикации откройте **GitHub → Packages → `developer-infra` → Package settings → Change visibility → Public**, чтобы `docker pull` работал без `docker login`.
+> - Для передачи образа офлайн («флешкой») запустите workflow `Release Multi-Arch GHCR Images` вручную (`workflow_dispatch`) с галочкой **`export_lite_tarball=true`** и загрузите на целевом ПК через `docker load -i developer-infra-lite-amd64.tar.gz`, затем `.\run-env.ps1 -Profile lite -NoBuild -AutoPort`.
 
 На Windows (особенно с Hyper-V/WinNAT) порты вроде `8080` могут попадать в системный `excludedportrange` (`WSAEACCES`). Перед запуском или автоматически при старте используйте встроенный preflight:
 
@@ -52,14 +59,17 @@ Get-ChildItem -Filter *.ps1 | Unblock-File
 # Проверить занятость портов, владельцев и наличие хостового VPN:
 .\run-env.ps1 -CheckPorts
 
-# Этап 1 (быстрый старт): поднять только VPN + Chromium и проверить сеть:
+# Этап 1 (быстрый старт из GHCR): поднять только VPN + Chromium и проверить сеть:
 .\run-env.ps1 -Profile lite -AutoPort -Detach
 .\diag-env.ps1
 
-# Этап 2 (после успешной проверки VPN): доставить IDE + AI-стек поверх кэша lite:
+# Этап 2 (после успешной проверки VPN): поднять полный образ IDE + AI-стек:
 .\run-env.ps1 -Profile full -AutoPort
 
-# Повторный запуск без пересборки образа:
+# Принудительная локальная сборка из Dockerfile (без pull):
+.\run-env.ps1 -Profile lite -AutoPort -LocalBuild
+
+# Повторный запуск уже скачанного/собранного образа без pull/build:
 .\run-env.ps1 -NoBuild -AutoPort
 ```
 
@@ -71,11 +81,12 @@ Get-ChildItem -Filter *.ps1 | Unblock-File
 
 #### Linux Desktop / Удалённый Linux-сервер (изолированный noVNC)
 ```bash
-chmod +x run-env.sh vpn-ctl.sh scripts/smoke-test.sh
+chmod +x run-env.sh vpn-ctl.sh diag-env.sh collect-logs.sh scripts/smoke-test.sh
 ./run-env.sh --check-ports
 ./run-env.sh --profile lite --auto-port --detach
 ./diag-env.sh
 ./run-env.sh --profile full --auto-port
+# Принудительная локальная сборка: ./run-env.sh --profile lite --auto-port --local-build
 ```
 
 #### Удалённый Linux-сервер через SSH-туннель
@@ -106,6 +117,7 @@ ssh -L 8080:127.0.0.1:8080 -L 6901:127.0.0.1:6901 -L 20128:127.0.0.1:20128 user@
 | Действие | Windows (PowerShell) | Linux / macOS |
 | :--- | :--- | :--- |
 | Статус VPN, активная нода, живой IP | `.\vpn-ctl.ps1 status` | `./vpn-ctl.sh status` |
+| Активная egress-политика (allowlist) | `.\vpn-ctl.ps1 policy` | `./vpn-ctl.sh policy` |
 | Жёсткий kill-switch (дефолт, TUN) | `.\vpn-ctl.ps1 strict` | `./vpn-ctl.sh strict` |
 | Авто-fallback при падении VPN (TUN) | `.\vpn-ctl.ps1 fallback` | `./vpn-ctl.sh fallback` |
 | Режим прокси без TUN (`127.0.0.1:2080`) | `.\vpn-ctl.ps1 proxy` | `./vpn-ctl.sh proxy` |
@@ -113,6 +125,10 @@ ssh -L 8080:127.0.0.1:8080 -L 6901:127.0.0.1:6901 -L 20128:127.0.0.1:20128 user@
 | Принудительно обновить подписку + pre-probe | `.\vpn-ctl.ps1 update` | `./vpn-ctl.sh update` |
 | Замерить задержку всех нод (`urltest`) | `.\vpn-ctl.ps1 retest` | `./vpn-ctl.sh retest` |
 | Нумерованный список нод / выбор по номеру | `.\vpn-ctl.ps1 select` / `.\vpn-ctl.ps1 select 2` | `./vpn-ctl.sh select` / `./vpn-ctl.sh select 2` |
+
+> **Политика доменов для AI-агента (`VPN_AGENT_POLICY`, opt-in):**
+> - По умолчанию `VPN_AGENT_POLICY=open` — обычный безлимитный выход через VPN.
+> - При `VPN_AGENT_POLICY=allowlist` `sing-box` пропускает TCP/UDP и DNS **только** к доменам из пресетов `VPN_ALLOW_PRESETS` (`ai,git,pkg,docs` или `none`) + `VPN_ALLOW_DOMAINS` (и служебных `ipinfo.io` / `www.gstatic.com` / хоста подписки), отклоняя остальные подключения и DNS-запросы (`action: reject`).
 
 > **Совместная работа с VPN на хосте:**
 > - **Независимый VPN контейнера (дефолт `strict`):** контейнер строит собственный `sing-tun` (MTU `1280`, `fwmark 0xff`), полностью независимый от отключений VPN на хосте.
@@ -201,9 +217,9 @@ python3 -m unittest discover -s tests -v
 ```
 На **Windows (PowerShell)**:
 - Быстрый прогон (автоматически пропускает POSIX bash-тесты): `python -m unittest discover -s tests -v`
-- Полный 100% прогон **включая POSIX-скрипты** внутри собранного образа:
+- Полный 100% прогон **включая POSIX-скрипты** внутри образа `:lite` (или `:full`):
 ```powershell
-docker run --rm --entrypoint python3 -v "$($PWD.Path):/repo:ro" -w /repo devbox-main-ubuntu-dev:latest -m unittest discover -s tests -v
+docker run --rm --entrypoint python3 -v "$($PWD.Path):/repo:ro" -w /repo ghcr.io/macsik121/developer-infra:lite -m unittest discover -s tests -v
 ```
 
 ### Живой Smoke-Test и полная системная диагностика

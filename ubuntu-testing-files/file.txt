@@ -1,0 +1,222 @@
+● osboxes
+    State: running
+    Units: 516 loaded (incl. loaded aliases)
+     Jobs: 0 queued
+   Failed: 0 units
+    Since: Fri 2026-11-27 06:57:45 EST; 5min ago
+  systemd: 255.4-1ubuntu8
+   CGroup: /
+           ├─8188 /usr/bin/python3 /usr/share/apport/apport -p8163 -s5 -c0 -d1 -P8163 -u1000 -g1000 -- "!usr!bin!ibus-daemon"
+           ├─init.scope
+           │ └─1 /sbin/init splash
+           ├─system.slice
+           │ ├─ModemManager.service
+           │ │ └─893 /usr/sbin/ModemManager
+           │ ├─NetworkManager.service
+           │ │ └─780 /usr/sbin/NetworkManager --no-daemon
+           │ ├─accounts-daemon.service
+           │ │ └─768 /usr/libexec/accounts-daemon
+           │ ├─avahi-daemon.service
+           │ │ ├─742 "avahi-daemon: running [osboxes.local]"
+           │ │ └─781 "avahi-daemon: chroot helper"
+           │ ├─colord.service
+           │ │ └─1271 /usr/libexec/colord
+           │ ├─containerd.service
+           │ │ └─1059 /usr/bin/containerd
+           │ ├─cron.service
+           │ │ └─769 /usr/sbin/cron -f -P
+           │ ├─cups-browsed.service
+           │ │ └─1241 /usr/sbin/cups-browsed
+           │ ├─cups.service
+           │ │ ├─1046 /usr/sbin/cupsd -l
+           │ │ ├─1071 /usr/lib/cups/notifier/dbus dbus://
+           │ │ ├─1072 /usr/lib/cups/notifier/dbus dbus://
+           │ │ ├─1073 /usr/lib/cups/notifier/dbus dbus://
+           │ │ └─1074 /usr/lib/cups/notifier/dbus dbus://
+           │ ├─dbus.service
+           │ │ └─743 @dbus-daemon --system --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+           │ ├─docker.service
+           │ │ └─1248 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+           │ ├─gdm.service
+           │ │ └─1076 /usr/sbin/gdm3
+           │ ├─gnome-remote-desktop.service
+           │ │ └─746 /usr/libexec/gnome-remote-desktop-daemon --system
+           │ ├─kerneloops.service
+           │ │ ├─1253 /usr/sbin/kerneloops --test
+           │ │ └─1258 /usr/sbin/kerneloops
+           │ ├─polkit.service
+           │ │ └─762 /usr/lib/polkit-1/polkitd --no-debug
+           │ ├─power-profiles-daemon.service
+           │ │ └─763 /usr/libexec/power-profiles-daemon
+           │ ├─rsyslog.service
+           │ │ └─804 /usr/sbin/rsyslogd -n -iNONE
+           │ ├─rtkit-daemon.service
+           │ │ └─1134 /usr/libexec/rtkit-daemon
+           │ ├─snapd.service
+           │ │ └─766 /usr/lib/snapd/snapd
+           │ ├─switcheroo-control.service
+           │ │ └─770 /usr/libexec/switcheroo-control
+           │ ├─systemd-journald.service
+           │ │ └─326 /usr/lib/systemd/systemd-journald
+           │ ├─systemd-logind.service
+           │ │ └─767 /usr/lib/systemd/systemd-logind
+           │ ├─systemd-oomd.service
+           │ │ └─480 /usr/lib/systemd/systemd-oomd
+           │ ├─systemd-timedated.service
+           │ │ └─8090 /usr/lib/systemd/systemd-timedated
+           │ ├─systemd-timesyncd.service
+           │ │ └─703 /usr/lib/systemd/systemd-timesyncd
+           │ ├─systemd-udevd.service
+           │ │ └─udev
+           │ │   └─394 /usr/lib/systemd/systemd-udevd
+           │ ├─ubuntu-advantage-desktop-daemon.service
+           │ │ └─2860 /usr/libexec/ubuntu-advantage-desktop-daemon
+           │ ├─udisks2.service
+           │ │ └─772 /usr/libexec/udisks2/udisksd
+           │ ├─unattended-upgrades.service
+           │ │ └─1052 /usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal
+           │ ├─upower.service
+           │ │ └─1334 /usr/libexec/upowerd
+           │ ├─virtualbox-guest-utils.service
+           │ │ └─901 /usr/sbin/VBoxService
+           │ └─wpa_supplicant.service
+           │   └─782 /usr/sbin/wpa_supplicant -u -s -O "DIR=/run/wpa_supplicant GROUP=netdev"
+           └─user.slice
+             └─user-1000.slice
+               ├─session-2.scope
+               │ ├─1960 "gdm-session-worker [pam/gdm-password]"
+               │ ├─2053 /usr/libexec/gdm-wayland-session "env GNOME_SHELL_SESSION_MODE=ubuntu /usr/bin/gnome-session --session=ubuntu"
+               │ └─2061 /usr/libexec/gnome-session-binary --session=ubuntu
+               └─user@1000.service
+                 ├─app.slice
+                 │ ├─app-gnome-at\x2dspi\x2ddbus\x2dbus-2233.scope
+                 │ │ └─2233 /usr/libexec/at-spi-bus-launcher --launch-immediately
+                 │ ├─app-gnome-org.gnome.Evolution\x2dalarm\x2dnotify-2412.scope
+                 │ │ └─2412 /usr/libexec/evolution-data-server/evolution-alarm-notify
+                 │ ├─app-gnome-org.gnome.SettingsDaemon.DiskUtilityNotify-2433.scope
+                 │ │ └─2433 /usr/libexec/gsd-disk-utility-notify
+                 │ ├─app-gnome-update\x2dnotifier-4006.scope
+                 │ │ └─4006 /usr/bin/update-notifier
+                 │ ├─app-gnome-x\x2dterminal\x2demulator-3119.scope
+                 │ │ ├─3119 /usr/bin/python3 /usr/bin/gnome-terminal --wait
+                 │ │ └─3122 /usr/bin/gnome-terminal.real --wait
+                 │ ├─app-gnome-x\x2dterminal\x2demulator-3819.scope
+                 │ │ ├─3819 /usr/bin/python3 /usr/bin/gnome-terminal --wait
+                 │ │ └─3821 /usr/bin/gnome-terminal.real --wait
+                 │ ├─app-gnome\x2dsession\x2dmanager.slice
+                 │ │ └─gnome-session-manager@ubuntu.service
+                 │ │   ├─2186 /usr/libexec/gnome-session-binary --systemd-service --session=ubuntu
+                 │ │   ├─2246 /usr/bin/dbus-daemon --config-file=/usr/share/defaults/at-spi2/accessibility.conf --nofork --print-address 11 --address=unix:path=/run/user/1000/at-spi/bus
+                 │ │   └─2302 /usr/libexec/at-spi2-registryd --use-gnome-session
+                 │ ├─app-org.gnome.Terminal.slice
+                 │ │ ├─gnome-terminal-server.service
+                 │ │ │ └─3142 /usr/libexec/gnome-terminal-server
+                 │ │ ├─vte-spawn-2cff44a5-3142-4d11-b270-7ae29c43d994.scope
+                 │ │ │ └─3827 bash
+                 │ │ ├─vte-spawn-42518b26-0b7f-4e65-855d-90db2b281e18.scope
+                 │ │ │ ├─5519 bash
+                 │ │ │ ├─5658 sudo -s
+                 │ │ │ ├─5696 sudo -s
+                 │ │ │ ├─5697 /bin/bash
+                 │ │ │ ├─8195 sudo systemctl status
+                 │ │ │ ├─8196 sudo systemctl status
+                 │ │ │ └─8197 systemctl status
+                 │ │ └─vte-spawn-9c4f79f3-8d5a-4845-95f9-74d9ff595974.scope
+                 │ │   ├─3515 bash
+                 │ │   ├─3954 sudo -s
+                 │ │   ├─4086 sudo -s
+                 │ │   └─4087 /bin/bash
+                 │ ├─dconf.service
+                 │ │ └─2337 /usr/libexec/dconf-service
+                 │ ├─evolution-addressbook-factory.service
+                 │ │ └─2625 /usr/libexec/evolution-addressbook-factory
+                 │ ├─evolution-calendar-factory.service
+                 │ │ └─2590 /usr/libexec/evolution-calendar-factory
+                 │ ├─evolution-source-registry.service
+                 │ │ └─2333 /usr/libexec/evolution-source-registry
+                 │ ├─gcr-ssh-agent.service
+                 │ │ └─2127 /usr/libexec/gcr-ssh-agent --base-dir /run/user/1000/gcr
+                 │ ├─gnome-keyring-daemon.service
+                 │ │ └─1994 /usr/bin/gnome-keyring-daemon --foreground --components=pkcs11,secrets --control-directory=/run/user/1000/keyring
+                 │ ├─gnome-session-monitor.service
+                 │ │ └─2129 /usr/libexec/gnome-session-ctl --monitor
+                 │ ├─xdg-desktop-portal-gnome.service
+                 │ │ └─3450 /usr/libexec/xdg-desktop-portal-gnome
+                 │ └─xdg-desktop-portal-gtk.service
+                 │   └─3484 /usr/libexec/xdg-desktop-portal-gtk
+                 ├─init.scope
+                 │ ├─1970 /usr/lib/systemd/systemd --user
+                 │ └─1973 "(sd-pam)"
+                 └─session.slice
+                   ├─dbus.service
+                   │ ├─2003 /usr/bin/dbus-daemon --session --address=systemd: --nofork --nopidfile --systemd-activation --syslog-only
+                   │ ├─2315 /usr/libexec/gnome-shell-calendar-server
+                   │ ├─2343 /usr/bin/gjs -m /usr/share/gnome-shell/org.gnome.Shell.Notifications
+                   │ ├─2551 /usr/libexec/goa-daemon
+                   │ ├─2578 /usr/libexec/goa-identity-service
+                   │ └─2705 /usr/bin/gjs -m /usr/share/gnome-shell/org.gnome.ScreenSaver
+                   ├─filter-chain.service
+                   │ └─1989 /usr/bin/pipewire -c filter-chain.conf
+                   ├─gvfs-afc-volume-monitor.service
+                   │ └─2576 /usr/libexec/gvfs-afc-volume-monitor
+                   ├─gvfs-daemon.service
+                   │ ├─2141 /usr/libexec/gvfsd
+                   │ ├─2163 /usr/libexec/gvfsd-fuse /run/user/1000/gvfs -f
+                   │ └─2674 /usr/libexec/gvfsd-trash --spawner :1.19 /org/gtk/gvfs/exec_spaw/0
+                   ├─gvfs-goa-volume-monitor.service
+                   │ └─2605 /usr/libexec/gvfs-goa-volume-monitor
+                   ├─gvfs-gphoto2-volume-monitor.service
+                   │ └─2600 /usr/libexec/gvfs-gphoto2-volume-monitor
+                   ├─gvfs-metadata.service
+                   │ └─4005 /usr/libexec/gvfsd-metadata
+                   ├─gvfs-mtp-volume-monitor.service
+                   │ └─2591 /usr/libexec/gvfs-mtp-volume-monitor
+                   ├─gvfs-udisks2-volume-monitor.service
+                   │ └─2511 /usr/libexec/gvfs-udisks2-volume-monitor
+                   ├─org.freedesktop.IBus.session.GNOME.service
+                   │ └─8163 /usr/bin/ibus-daemon --panel disable
+                   ├─org.gnome.SettingsDaemon.A11ySettings.service
+                   │ └─2355 /usr/libexec/gsd-a11y-settings
+                   ├─org.gnome.SettingsDaemon.Color.service
+                   │ └─2356 /usr/libexec/gsd-color
+                   ├─org.gnome.SettingsDaemon.Datetime.service
+                   │ └─2359 /usr/libexec/gsd-datetime
+                   ├─org.gnome.SettingsDaemon.Housekeeping.service
+                   │ └─2361 /usr/libexec/gsd-housekeeping
+                   ├─org.gnome.SettingsDaemon.Keyboard.service
+                   │ └─2362 /usr/libexec/gsd-keyboard
+                   ├─org.gnome.SettingsDaemon.MediaKeys.service
+                   │ └─2366 /usr/libexec/gsd-media-keys
+                   ├─org.gnome.SettingsDaemon.Power.service
+                   │ └─2367 /usr/libexec/gsd-power
+                   ├─org.gnome.SettingsDaemon.PrintNotifications.service
+                   │ ├─2369 /usr/libexec/gsd-print-notifications
+                   │ └─2506 /usr/libexec/gsd-printer
+                   ├─org.gnome.SettingsDaemon.Rfkill.service
+                   │ └─2370 /usr/libexec/gsd-rfkill
+                   ├─org.gnome.SettingsDaemon.ScreensaverProxy.service
+                   │ └─2371 /usr/libexec/gsd-screensaver-proxy
+                   ├─org.gnome.SettingsDaemon.Sharing.service
+                   │ └─2375 /usr/libexec/gsd-sharing
+                   ├─org.gnome.SettingsDaemon.Smartcard.service
+                   │ └─2376 /usr/libexec/gsd-smartcard
+                   ├─org.gnome.SettingsDaemon.Sound.service
+                   │ └─2379 /usr/libexec/gsd-sound
+                   ├─org.gnome.SettingsDaemon.Wacom.service
+                   │ └─2380 /usr/libexec/gsd-wacom
+                   ├─org.gnome.SettingsDaemon.XSettings.service
+                   │ └─2905 /usr/libexec/gsd-xsettings
+                   ├─org.gnome.Shell@wayland.service
+                   │ ├─2247 /usr/bin/gnome-shell
+                   │ ├─2898 /usr/bin/Xwayland :0 -rootless -noreset -accessx -core -auth /run/user/1000/.mutter-Xwaylandauth.BRVMZ3 -listenfd 4 -listenfd 5 -displayfd 6 -initfd 7 -byteswappedclients
+                   │ └─2944 /usr/libexec/mutter-x11-frames
+                   ├─pipewire-pulse.service
+                   │ └─1993 /usr/bin/pipewire-pulse
+                   ├─pipewire.service
+                   │ └─1988 /usr/bin/pipewire
+                   ├─wireplumber.service
+                   │ └─1992 /usr/bin/wireplumber
+                   ├─xdg-desktop-portal.service
+                   │ └─2781 /usr/libexec/xdg-desktop-portal
+                   └─xdg-permission-store.service
+                     └─2313 /usr/libexec/xdg-permission-store

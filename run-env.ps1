@@ -6,6 +6,7 @@
     .\run-env.ps1
     .\run-env.ps1 -Profile lite -AutoPort
     .\run-env.ps1 -Profile full -AutoPort
+    .\run-env.ps1 -Profile lite -LocalBuild -AutoPort
     .\run-env.ps1 -CheckPorts
     .\run-env.ps1 -AutoPort -NoBuild
     .\run-env.ps1 -Mode headless
@@ -22,6 +23,7 @@ param(
 
     [string]$EnvFile = ".env",
     [switch]$Detach,
+    [switch]$LocalBuild,
     [switch]$NoBuild,
     [switch]$CheckPorts,
     [switch]$AutoPort,
@@ -38,12 +40,13 @@ Usage: .\run-env.ps1 [OPTIONS]
 
 Options:
   -Mode <wslg|headless>    Display mode (default: wslg for Docker Desktop WSL2; use headless for Hyper-V)
-  -Profile <lite|full>     Build target: 'lite' (fast VPN + Chromium check) or 'full' (IDE + AI stack; default from .env or full)
+  -Profile <lite|full>     Image profile: 'lite' (fast VPN + Chromium) or 'full' (IDE + AI stack; default from .env or full)
   -EnvFile <path>          Path to .env file (default: .env)
   -CheckPorts              Inspect host port availability / owners & host VPN status, then exit
   -AutoPort                Automatically increment (+1) conflicting host ports until free
   -Detach                  Start container without attaching an interactive shell
-  -NoBuild                 Skip --build on docker compose up
+  -LocalBuild              Force local Docker BuildKit build (--build) instead of pulling pre-built GHCR image
+  -NoBuild                 Skip registry pull and --build (start already-cached image)
   -Help, -h                Show this help
 "@
     exit 0
@@ -115,6 +118,7 @@ if ($envMap["NOVNC_PORT"]) { $novncPort = [int]$envMap["NOVNC_PORT"] }
 $omniPort = 20128
 if ($envMap["OMNIROUTE_PORT"]) { $omniPort = [int]$envMap["OMNIROUTE_PORT"] }
 $workspaceDir = if ($envMap["WORKSPACE_DIR"]) { $envMap["WORKSPACE_DIR"] } else { "./workspace" }
+$imageRepo = if ($envMap["DEV_INFRA_IMAGE"]) { $envMap["DEV_INFRA_IMAGE"] } else { "ghcr.io/macsik121/developer-infra" }
 $buildProfile = $Profile
 if ([string]::IsNullOrWhiteSpace($buildProfile)) {
     if ($envMap["DEV_INFRA_PROFILE"]) { $buildProfile = $envMap["DEV_INFRA_PROFILE"].ToLowerInvariant() }
@@ -298,17 +302,34 @@ if (-not (Test-Path -LiteralPath $workspaceDir)) {
 $overlay = if ($Mode -eq "wslg") { "docker-compose.wslg.yaml" } else { "docker-compose.headless.yaml" }
 $composeArgs = @("compose", "--env-file", $EnvFile, "-f", "docker-compose.yaml", "-f", $overlay)
 
-$upArgs = @("up", "-d")
-if (-not $NoBuild) {
-    $upArgs += "--build"
-}
-
 [Environment]::SetEnvironmentVariable("DEV_INFRA_PROFILE", $buildProfile, "Process")
 [Environment]::SetEnvironmentVariable("DOCKER_BUILDKIT", "1", "Process")
 [Environment]::SetEnvironmentVariable("COMPOSE_DOCKER_CLI_BUILD", "1", "Process")
 
-Write-Host "[run-env] Starting developer-infra (mode=$Mode, profile=$buildProfile, env=$EnvFile)..." -ForegroundColor Cyan
-& docker @composeArgs @upArgs
+if ($LocalBuild) {
+    Write-Host "[run-env] Starting developer-infra (mode=$Mode, profile=$buildProfile, source=local-build, env=$EnvFile)..." -ForegroundColor Cyan
+    & docker @composeArgs up -d --build
+} elseif ($NoBuild) {
+    Write-Host "[run-env] Starting developer-infra (mode=$Mode, profile=$buildProfile, source=cached, env=$EnvFile)..." -ForegroundColor Cyan
+    & docker @composeArgs up -d --no-build
+} else {
+    $imageRef = "${imageRepo}:${buildProfile}"
+    Write-Host "[run-env] Pulling pre-built image ($imageRef)..." -ForegroundColor Cyan
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & docker @composeArgs pull ubuntu-dev
+    $pullRc = $LASTEXITCODE
+    $ErrorActionPreference = $prevEap
+
+    if ($pullRc -eq 0) {
+        Write-Host "[run-env] Starting developer-infra (mode=$Mode, profile=$buildProfile, source=registry, env=$EnvFile)..." -ForegroundColor Cyan
+        & docker @composeArgs up -d --no-build
+    } else {
+        Write-Host "[run-env] Pre-built image unavailable ($imageRef); falling back to local BuildKit build..." -ForegroundColor Yellow
+        Write-Host "[run-env] Starting developer-infra (mode=$Mode, profile=$buildProfile, source=local-build, env=$EnvFile)..." -ForegroundColor Cyan
+        & docker @composeArgs up -d --build
+    }
+}
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }

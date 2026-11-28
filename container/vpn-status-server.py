@@ -221,6 +221,7 @@ def last_updater_line() -> str:
 def collect_status(force_egress: bool = False, skip_egress: bool = False) -> Dict[str, Any]:
     mode = read_text(os.path.join(RUN_VPN_DIR, "mode"), "strict")
     state = read_text(os.path.join(RUN_VPN_DIR, "state"), "UNKNOWN")
+    agent_policy = read_text(os.path.join(RUN_VPN_DIR, "policy"), os.environ.get("VPN_AGENT_POLICY", "open") or "open")
     tun_up = is_tun_up()
     sb_running = is_singbox_running()
     proxies = query_clash_proxies()
@@ -237,6 +238,7 @@ def collect_status(force_egress: bool = False, skip_egress: bool = False) -> Dic
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "mode": mode,
         "state": state,
+        "agent_policy": agent_policy,
         "tun_iface": TUN_IFACE,
         "tun_up": tun_up,
         "singbox_running": sb_running,
@@ -305,6 +307,7 @@ def render_html(st: Dict[str, Any]) -> str:
         <div class="kv"><div class="k">sing-box / TUN</div><div class="v">{'RUNNING' if st['singbox_running'] else 'STOPPED'} / {'UP' if st['tun_up'] else 'DOWN'}</div></div>
         <div class="kv"><div class="k">Active Node</div><div class="v">{html.escape(st['active_node'])} ({delay_str})</div></div>
         <div class="kv"><div class="k">Reachable Nodes</div><div class="v">{st['reachable_nodes']} / {st['total_nodes']}</div></div>
+        <div class="kv" style="grid-column: 1 / -1;"><div class="k">Agent Egress Policy</div><div class="v">{html.escape(str(st.get('agent_policy', 'open')))}</div></div>
         <div class="kv" style="grid-column: 1 / -1;"><div class="k">Live Egress (ipinfo.io)</div><div class="v">{egress_str}</div></div>
       </div>
       <div class="links">

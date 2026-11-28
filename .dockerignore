@@ -1,8 +1,10 @@
 # Git & docs
 .git
+.github/
 .gitignore
 .gitattributes
 README.md
+LICENSE
 project-design-rules.md
 
 # Secrets & local runtime files (NEVER bake into Docker image)
